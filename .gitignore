@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Generated artifacts (never commit generated data or logs)
+data/
+logs/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

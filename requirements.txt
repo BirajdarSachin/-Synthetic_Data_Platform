@@ -1,0 +1,2 @@
+# Milestone 1: standard library only - no dependencies.
+# Dependencies are added only when a milestone needs them (see docs/decisions.md).
