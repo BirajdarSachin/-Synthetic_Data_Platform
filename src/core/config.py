@@ -7,6 +7,7 @@ ConfigError with a clear message - we never continue with a half-valid config.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -18,6 +19,13 @@ from src.core.paths import resolve_path
 logger = logging.getLogger(__name__)
 
 SUPPORTED_FORMATS = ("csv",)  # json/parquet arrive in Phase 3
+
+# ADR-0012: default history span preserves pre-0.3.0 behavior (3 * 365 days).
+DEFAULT_HISTORY = "3y"
+
+# ADR-0012 duration units: fixed lengths so config + seed stays deterministic.
+_DURATION_UNIT_DAYS = {"y": 365, "m": 30, "d": 1}
+_DURATION_TOKEN = re.compile(r"\d+[ymd]")
 
 
 class ConfigError(Exception):
@@ -32,6 +40,7 @@ class RunConfig:
 @dataclass(frozen=True)
 class GenerationConfig:
     reference_date: date
+    history_days: int
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,37 @@ class PipelineConfig:
     generation: GenerationConfig
     datasets: dict[str, DatasetConfig]
     output: OutputConfig
+
+
+def parse_duration_to_days(value: str) -> int:
+    """Parse a compact duration string into days (ADR-0012).
+
+    Accepted forms: '30d', '4m', '2y', '1y6m', '2y3m10d'.
+    Units: y = 365 days, m = 30 days, d = 1 day. Each unit may appear once.
+    Raises ConfigError for anything else.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(
+            "generation.history must be a string like '3y', '6m', '30d' or '1y6m'"
+        )
+    text = value.strip().lower().replace(" ", "")
+    tokens = _DURATION_TOKEN.findall(text)
+    if not tokens or "".join(tokens) != text:
+        raise ConfigError(
+            f"generation.history has invalid format: {value!r}. "
+            "Use forms like '3y', '6m', '30d', '1y6m'."
+        )
+    total_days = 0
+    seen_units: set[str] = set()
+    for token in tokens:
+        number, unit = int(token[:-1]), token[-1]
+        if unit in seen_units:
+            raise ConfigError(f"generation.history repeats unit {unit!r}: {value!r}")
+        seen_units.add(unit)
+        total_days += number * _DURATION_UNIT_DAYS[unit]
+    if total_days <= 0:
+        raise ConfigError(f"generation.history must span at least 1 day: {value!r}")
+    return total_days
 
 
 def load_config(config_file: Path) -> PipelineConfig:
@@ -96,7 +136,9 @@ def _parse_generation(section: object) -> GenerationConfig:
     value = section["reference_date"]
     # yaml.safe_load already parses YYYY-MM-DD into a datetime.date.
     if isinstance(value, date):
-        return GenerationConfig(reference_date=value)
+        # history is optional; default keeps pre-0.3.0 behavior (ADR-0012).
+        history_days = parse_duration_to_days(section.get("history", DEFAULT_HISTORY))
+        return GenerationConfig(reference_date=value, history_days=history_days)
     raise ConfigError("generation.reference_date must be a date in YYYY-MM-DD form")
 
 
@@ -128,6 +170,7 @@ def _log_resolved(config: PipelineConfig) -> None:
     """Log every resolved value (ADR-0009: the CONFIG stage contract)."""
     logger.info("[CONFIG] seed=%s", config.run.seed)
     logger.info("[CONFIG] reference_date=%s", config.generation.reference_date.isoformat())
+    logger.info("[CONFIG] history_days=%s", config.generation.history_days)
     for dataset in config.datasets.values():
         logger.info("[CONFIG] dataset=%s records=%s", dataset.name, dataset.records)
     logger.info("[CONFIG] output.directory=%s", config.output.directory)

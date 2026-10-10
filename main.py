@@ -1,6 +1,6 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Milestone 2 pipeline: config -> seed -> generate -> write -> manifest.
+Pipeline: config -> seed -> generate -> write -> manifest.
 """
 
 import logging
@@ -47,6 +47,7 @@ def main() -> None:
         generator = CustomerGenerator(
             seed=child_seed,
             reference_date=config.generation.reference_date,
+            history_days=config.generation.history_days,
         )
         # File naming contract (ADR-0004): {entity}_{date}.{format}
         file_path = config.output.directory / (

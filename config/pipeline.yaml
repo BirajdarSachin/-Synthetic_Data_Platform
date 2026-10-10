@@ -6,6 +6,8 @@ run:
 
 generation:
   reference_date: 2026-01-15  # simulated "today" for generated data (ADR-0003)
+  history: "10y"               # how far back history extends:
+                              # '10y', '2y', '4m', '30d', '1y6m' (ADR-0012)
 
 datasets:
   customer:

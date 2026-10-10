@@ -68,3 +68,9 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Why: One predictable layout is a contract downstream projects rely on; a separate _manifests/ folder keeps metadata out of data-file glob patterns.
 - Alternatives: Manifests next to data files (pollutes globs); manifests under logs/ (mixes human logs with machine metadata).
 - Impact: src/metadata/manifest.py, main.py; all future phases keep this layout.
+
+## ADR-0012 - Configurable history span (generation.history)
+- Decision: generation.history is an optional string duration ('30d', '4m', '2y', '1y6m'; units y=365d, m=30d, d=1d; each unit at most once) parsed to history_days. Default '3y' (= 1095 days) preserves pre-0.3.0 behavior exactly. Generators receive history_days as a constructor parameter; the manifest records history_days.
+- Why: History depth is a business decision (10y for warehouse testing, 4m for quick runs) and was hardcoded in the generator; making it config-driven gives one knob for all future entities.
+- Alternatives: Calendar-accurate months via dateutil.relativedelta (rejected: extra dependency; month-length precision irrelevant for synthetic spans); integer days only (rejected: '10y' is more readable than '3650'); per-dataset history (deferred: optional per-dataset override may be added in Phase 2/5 if entities need different spans; global stays the default).
+- Impact: Backward-compatible config addition (optional key, identical default); CustomerGenerator signature extended (internal API, no external consumers); manifest gains history_days; customer SCHEMA_VERSION unchanged (structure untouched - only the generation window changed).

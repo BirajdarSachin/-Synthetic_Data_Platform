@@ -2,7 +2,7 @@
 
 import hashlib
 from dataclasses import asdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from src.generators.customer import CustomerGenerator
@@ -13,8 +13,10 @@ from src.writers.csv_writer import write_csv
 REFERENCE_DATE = date(2026, 1, 15)
 
 
-def _generate(seed: int, count: int) -> list[Customer]:
-    generator = CustomerGenerator(seed=seed, reference_date=REFERENCE_DATE)
+def _generate(seed: int, count: int, history_days: int = 1095) -> list[Customer]:
+    generator = CustomerGenerator(
+        seed=seed, reference_date=REFERENCE_DATE, history_days=history_days
+    )
     return list(generator.generate(count))
 
 
@@ -46,11 +48,21 @@ def test_registration_date_not_in_future():
     assert all(c.registration_date <= REFERENCE_DATE for c in customers)
 
 
+def test_registration_date_within_history_window():
+    """Lower boundary of the history window is respected (ADR-0012)."""
+    history_days = 365
+    earliest = REFERENCE_DATE - timedelta(days=history_days)
+    customers = _generate(seed=7, count=100, history_days=history_days)
+    assert all(earliest <= c.registration_date <= REFERENCE_DATE for c in customers)
+
+
 def test_csv_output_is_byte_identical_for_same_seed(tmp_path: Path):
     """The strongest reproducibility proof: same seed -> identical bytes."""
     digests = []
     for _ in range(2):
-        generator = CustomerGenerator(seed=12345, reference_date=REFERENCE_DATE)
+        generator = CustomerGenerator(
+            seed=12345, reference_date=REFERENCE_DATE, history_days=1095
+        )
         path = tmp_path / "customer.csv"
         write_csv(path, generator.generate(100))
         digests.append(hashlib.sha256(path.read_bytes()).hexdigest())

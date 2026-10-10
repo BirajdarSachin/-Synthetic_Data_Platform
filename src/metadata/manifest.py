@@ -30,6 +30,7 @@ def build_run_header(run_id: str, config: PipelineConfig, duration_s: float) -> 
         "faker_version": importlib.metadata.version("faker"),
         "master_seed": config.run.seed,
         "reference_date": config.generation.reference_date.isoformat(),
+        "history_days": config.generation.history_days,
         "config_file": str(config.config_file),
         "output_format": config.output.format,
         "duration_s": round(duration_s, 2),
