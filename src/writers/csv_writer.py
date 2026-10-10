@@ -1,13 +1,17 @@
 """CSV writer - turns dataclass records into a CSV file (ADR-0004, ADR-0005).
 
-A shared Writer interface (ABC) will be introduced in Phase 3, when a second
-format exists - not before. Single-implementation ABCs are premature.
+Serialization rules (the writer is the only place that knows formats):
+  * date          -> ISO-8601 string
+  * Decimal money -> string with exactly 2 decimal places (ADR-0002)
+Overwrite policy ADR-0013: rebuilding an existing dataset overwrites its file,
+and says so in the log.
 """
 
 import csv
 import logging
 from dataclasses import asdict, fields
 from datetime import date
+from decimal import Decimal
 from itertools import chain
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,6 +37,10 @@ def write_csv(file_path: Path, records: Iterable[Any]) -> int:
     fieldnames = [f.name for f in fields(first)]
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if file_path.exists():
+        # ADR-0013: overwrite is intentional (rebuild-in-place) - but never silent.
+        logger.info("[WRITER] overwriting existing file=%s", file_path)
+
     count = 0
     try:
         # newline="" is required by the csv module to avoid blank lines on Windows.
@@ -57,7 +65,18 @@ def write_csv(file_path: Path, records: Iterable[Any]) -> int:
 
 
 def _to_row(record: Any) -> dict[str, Any]:
-    """Convert a dataclass to a CSV-ready dict (dates -> ISO-8601 strings)."""
+    """Convert a dataclass to a CSV-ready dict (dates and decimals to strings)."""
     row = asdict(record)
-    return {key: (value.isoformat() if isinstance(value, date) else value)
-            for key, value in row.items()}
+    return {
+        key: _to_cell(value)
+        for key, value in row.items()
+    }
+
+
+def _to_cell(value: Any) -> Any:
+    """Serialize one cell value according to the writer's format rules."""
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return f"{value:.2f}"
+    return value

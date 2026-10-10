@@ -17,19 +17,18 @@ Relative paths resolve against the project root (ADR-0010).
 ## History (ADR-0012)
 
 `generation.history` controls how far back generated history extends. The
-window for historical dates becomes:
-[reference_date - history_days, reference_date].
+window for historical dates is [reference_date - history_days, reference_date].
+Accepted forms: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'.
+Units are fixed lengths (y=365d, m=30d) so config + seed stays deterministic.
 
-Accepted forms: integer + unit, combinable, each unit at most once:
-- `d` = days, `m` = months (fixed 30 days), `y` = years (fixed 365 days)
-- Examples: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'
+## Dataset composition rules
 
-Units are fixed lengths (not calendar-accurate) so that a given config plus
-seed always yields the same data (ADR-0006, ADR-0012).
+- product requires supplier in datasets (FK dependency, ADR-0014).
+  Violations raise ConfigError before anything is written.
 
 ## Error behavior
 Missing or invalid keys raise ConfigError with a specific message; the run
 stops before any file is written.
 
 ## Known datasets
-customer (Phase 2 adds product, order, order_item, payment).
+customer, supplier, product (Milestone 3b adds employee, order, order_item, payment).
