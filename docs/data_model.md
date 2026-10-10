@@ -1,57 +1,53 @@
 # Data Model
 
-Entity schemas are the platform data contracts (ADR-0007). Any change to a
-schema below must follow the SCHEMA_VERSION rules in ADR-0007.
+Entity schemas are the platform data contracts (ADR-0007). Any change must
+follow the SCHEMA_VERSION rules in ADR-0007.
 
 Generation order follows FK dependencies (ADR-0014):
-customer, supplier (independent) -> product (needs supplier).
+customer, supplier, employee -> product, order -> order_item -> payment.
 
 ## customer - schema v1.0
-
-One row = one registered customer. Primary key: customer_id.
-
-| Column            | Type | Rules                                                                   |
-|-------------------|------|-------------------------------------------------------------------------|
-| customer_id       | int  | Sequential, starts at 1, unique (ADR-0001)                              |
-| first_name        | str  | Non-empty                                                               |
-| last_name         | str  | Non-empty                                                               |
-| email             | str  | Unique across the dataset                                               |
-| phone             | str  | Faker-generated phone format                                            |
-| city              | str  | Faker-generated city                                                    |
-| country           | str  | Faker-generated country                                                 |
-| registration_date | date | ISO-8601; within [reference_date - history, reference_date] (ADR-0012)  |
+PK customer_id (sequential from 1). Columns: first_name, last_name, email
+(unique), phone, city, country, registration_date (within history window,
+ADR-0012). Parent of order.
 
 ## supplier - schema v1.0
-
-One row = one supplier. Primary key: supplier_id. Parent of product.
-
-| Column         | Type | Rules                        |
-|----------------|------|------------------------------|
-| supplier_id    | int  | Sequential, starts at 1      |
-| supplier_name  | str  | Company name                 |
-| contact_name   | str  | Person name                  |
-| contact_email  | str  | Company-style email          |
-| phone          | str  | Faker-generated phone format |
-| city           | str  | Faker-generated city         |
-| country        | str  | Faker-generated country      |
+PK supplier_id. Columns: supplier_name, contact_name, contact_email, phone,
+city, country. Parent of product.
 
 ## product - schema v1.0
+PK product_id. FK supplier_id -> supplier (1..supplier.records, ADR-0014).
+Columns: product_name, category (7 fixed values), unit_price
+(Decimal > 0, 2dp; CSV "1234.56", ADR-0002). Parent of order_item.
 
-One row = one product. Primary key: product_id. FK: supplier_id.
+## employee - schema v1.0
+PK employee_id. Columns: first_name, last_name, email (unique), job_title
+(6 fixed sales titles), hire_date (within history window), city, country.
+Parent of order (sales rep).
 
-| Column       | Type    | Rules                                                        |
-|--------------|---------|--------------------------------------------------------------|
-| product_id   | int     | Sequential, starts at 1                                      |
-| product_name | str     | Two-word descriptive name                                    |
-| category     | str     | One of 7 fixed categories (see product generator)            |
-| unit_price   | decimal | > 0, exactly 2 decimal places; CSV as string "1234.56" (ADR-0002) |
-| supplier_id  | int FK  | Must be an existing supplier_id: 1..supplier.records (ADR-0014) |
+## order - schema v1.0
+PK order_id. FKs: customer_id -> customer, sales_rep_employee_id -> employee.
+Columns: order_date, status in {completed, pending, cancelled}
+(~70/20/10 deterministic split).
+Business rules (ADR-0016): order_date >= that customer's registration_date
+(ADR-0015 context). Parent of order_item and payment.
 
-Relationships:
-- product.supplier_id -> supplier.supplier_id (many products per supplier)
+## order_item - schema v1.0
+PK order_item_id. FKs: order_id -> order, product_id -> product.
+Columns: quantity (1..5), unit_price (= referenced product's unit_price).
+Business rules: every order has >= 1 item (order_item.records >=
+order.records enforced in main.py).
 
-Integrity rule: changing datasets.supplier.records changes which supplier a
-product gets - that is a config change, not a bug; the manifest records it.
+## payment - schema v1.0
+PK payment_id. FK order_id -> order. Columns: payment_date, amount
+(Decimal, 2dp), payment_method in {credit_card, bank_transfer, paypal, cash}.
+Business rules: at most one payment per order; completed orders only;
+payment_date >= order_date; amount = sum(quantity * unit_price) of the
+order's items.
 
-Planned (Milestone 3b): employee, order (FK customer + employee),
-order_item (FK order + product), payment (FK order).
+## Relationship map
+supplier -> product -> order_item <- order -> payment
+customer -> order <- employee (sales rep)
+
+Note: all records land in one file per entity today; per-window partitioned
+output arrives in Phase 5.

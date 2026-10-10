@@ -4,85 +4,97 @@ Format: Decision / Why / Alternatives / Impact.
 ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 
 ## ADR-0001 - Sequential integer primary keys
-- Decision: Entities use sequential int PKs (1, 2, 3, ...).
-- Why: Deterministic, human-debuggable, naturally ordered (helps CDC later).
-- Alternatives: UUIDs - realistic but hard to eyeball; addable later as extra columns (non-breaking).
-- Impact: All entity models; simple downstream joins. PAYOFF: makes FK generation trivially deterministic (ADR-0014).
+- Decision: Sequential int PKs (1, 2, 3, ...).
+- Why: Deterministic, debuggable, ordered (helps CDC later).
+- Alternatives: UUIDs (harder to eyeball; addable later as extra columns).
+- Impact: All models; enables ADR-0014.
 
 ## ADR-0002 - Money as decimal
-- Decision: Monetary values are decimal.Decimal in models; writers serialize with exactly 2 decimal places.
+- Decision: decimal.Decimal in models; writers serialize with exactly 2 decimal places.
 - Why: Floats corrupt money; warehouses expect DECIMAL semantics.
-- Alternatives: Integer cents (precise, less readable); float (rejected).
-- Impact: product.unit_price (Milestone 3a); payment.amount (3b); csv_writer serialization rules.
+- Alternatives: Integer cents; float (rejected).
+- Impact: product.unit_price, order_item.unit_price, payment.amount.
 
 ## ADR-0003 - Time conventions
-- Decision: Timestamps are UTC ISO-8601; business dates are plain dates; "now" is injected from config, never the real clock.
-- Why: Determinism, no timezone bugs, foundation for late/out-of-order events.
-- Alternatives: Real clock (non-reproducible, rejected).
-- Impact: Every timestamped entity; incremental and event phases.
+- Decision: UTC ISO-8601 timestamps; plain dates; "now" injected from config, never the real clock.
+- Why: Determinism; foundation for late/out-of-order events.
+- Alternatives: Real clock (non-reproducible).
+- Impact: All timestamped entities; Phases 5-6.
 
 ## ADR-0004 - Naming conventions
-- Decision: Entities singular snake_case (customer, order, order_item); columns snake_case; files {entity}_{date}.{format}.
-- Why: One unambiguous convention across models, files, and future tables.
-- Alternatives: Plural names (equally valid - we pick once).
-- Impact: All datasets, file names, warehouse table names.
+- Decision: Entities singular snake_case; columns snake_case; files {entity}_{date}.{format}.
+- Why: One unambiguous convention.
+- Alternatives: Plural names.
+- Impact: All datasets, files, future tables.
 
 ## ADR-0005 - Internal representation
-- Decision: Records are plain dataclasses; generators yield records one at a time; pandas allowed only inside writers (Phase 3+).
-- Why: Dependency-free, testable core that streams to any scale without rewriting.
-- Alternatives: pandas core (slow per-row, heavy coupling - rejected).
+- Decision: Frozen dataclasses; generators yield records; pandas only inside writers (Phase 3+).
+- Why: Dependency-free, testable, streaming core.
+- Alternatives: pandas core (rejected).
 - Impact: All generators and writers.
 
 ## ADR-0006 - Reproducibility
-- Decision: One master seed in config; child seeds derived per entity; only random.Random instances (no global random state); every run writes a manifest.
-- Why: Global seeding breaks under code reordering and parallelism; manifests make runs auditable.
-- Alternatives: random.seed() global state (fragile - rejected).
-- Impact: Seed manager, manifest, future chunking/parallelism.
+- Decision: Master seed + SHA-256 child seeds per entity; only random.Random instances; manifest per run.
+- Why: Global seeding breaks under reordering/parallelism.
+- Alternatives: random.seed() global (rejected).
+- Impact: Seed manager; future per-window seeds (Phase 5).
 
 ## ADR-0007 - Schema versioning
-- Decision: Field definitions live in src/models/; each entity has SCHEMA_VERSION; additive change = minor bump; removal/type change = major bump requiring approval.
-- Why: Downstream projects must detect schema change instead of silently breaking.
+- Decision: Models own SCHEMA_VERSION; additive = minor; removal/type change = major + approval.
+- Why: Downstream projects must detect change.
 - Alternatives: None (silent drift unacceptable).
-- Impact: All models; manifests record schema_version.
+- Impact: All models; manifests.
 
 ## ADR-0008 - Configuration format
-- Decision: YAML files, loaded and validated into typed Python objects.
-- Why: Human-readable, comment-friendly, git-diffable; config is itself a contract.
-- Alternatives: JSON (no comments), TOML (fine, less common in DE tooling).
-- Impact: config/ layout; config loader.
+- Decision: YAML validated into typed frozen dataclasses.
+- Why: Readable, comment-friendly, diffable.
+- Alternatives: JSON, TOML.
+- Impact: config/ + loader.
 
 ## ADR-0009 - Logging contract
-- Decision: stdlib logging only (never print). One logger per module via logging.getLogger(__name__). Console = INFO; per-run file logs/run_<run_id>.log = DEBUG. Message format "[STAGE] message key=value". Stage tags: STARTUP, CONFIG, SEED, GENERATION, WRITER, MANIFEST, SUMMARY. configure_logging() called once, in main.py. Unhandled failures logged via run() wrapper with exit codes 0/1/130.
-- Why: Logging conventions are a contract; crashes must reach the run log.
-- Alternatives: print; structlog (deferred); loguru (external dep without need).
-- Impact: Every module. Rules: no per-record INFO logging; lazy %-formatting; no secrets.
+- Decision: stdlib logging; per-module loggers; console INFO, per-run file DEBUG; "[STAGE] message key=value"; stage tags STARTUP/CONFIG/SEED/GENERATION/WRITER/MANIFEST/SUMMARY; crashes logged via run() wrapper, exit codes 0/1/130.
+- Why: Contracts, greppability, forensics.
+- Alternatives: print; structlog (deferred).
+- Impact: Every module.
 
 ## ADR-0010 - Relative paths resolve against the project root
-- Decision: All relative paths from configuration resolve against the project root (parent of src/), via src/core/paths.py.
-- Why: A run must behave identically no matter where it was started from.
-- Alternatives: Resolve against cwd (rejected); absolute paths required (rejected).
-- Impact: src/core/paths.py; config loading; all writers and scripts.
+- Decision: paths.py anchors all relative paths at the project root.
+- Why: Identical behavior from any cwd.
+- Alternatives: cwd-relative (rejected).
+- Impact: Config, writers, scripts.
 
 ## ADR-0011 - Output directory layout
-- Decision: Generated datasets live in data/generated/ as {entity}_{date}.{format}; run manifests live in data/generated/_manifests/run_<run_id>.json.
-- Why: One predictable layout is a contract downstream projects rely on.
-- Alternatives: Manifests next to data files (pollutes globs); manifests under logs/ (mixes streams).
-- Impact: manifest.py, main.py; all future phases keep this layout.
+- Decision: data/generated/{entity}_{date}.{format}; manifests in data/generated/_manifests/.
+- Why: Predictable contract; manifests out of data globs.
+- Alternatives: Manifests beside data (rejected).
+- Impact: Writers, main.py.
 
 ## ADR-0012 - Configurable history span (generation.history)
-- Decision: Optional duration string ('30d', '4m', '2y', '1y6m'; y=365d, m=30d, d=1d; each unit once) parsed to history_days; default '3y' preserves pre-0.3.0 behavior; manifest records history_days.
-- Why: History depth is a business decision; one knob for all future entities.
-- Alternatives: Calendar-accurate months via dateutil (rejected: dependency); integer days (rejected: readability).
-- Impact: config.py, all date-generating entities. Backward-compatible addition.
+- Decision: Optional duration string parsed to history_days; default '3y'; manifest records it.
+- Why: History depth is a business decision.
+- Alternatives: dateutil (rejected: dependency).
+- Impact: config.py; all date-generating entities.
 
 ## ADR-0013 - Overwrite policy: rebuild-in-place
-- Decision: Re-running with the same reference_date rebuilds (overwrites) the dataset files; the writer logs "[WRITER] overwriting existing file=..." whenever it overwrites. Older manifests remain historical records of past runs but may no longer match files on disk.
-- Why: Matches how lakehouses treat partition overwrites; keeps the run -> tweak -> run loop fast; the latest manifest always describes the current files.
-- Alternatives: Refuse to overwrite (safer, tedious); run_id in filenames (strongest audit but breaks ADR-0004 naming contract - would need formal approval and causes file accumulation).
-- Impact: csv_writer logs overwrites. NOTE: adopted as the recommended default after being proposed; user may supersede with option B or C before Milestone 3b. Atomic writes (temp file + os.replace) planned as a Phase 3 writer upgrade.
+- Decision: Re-running overwrites dataset files; writer logs "[WRITER] overwriting existing file=...". Old manifests remain historical records.
+- Why: Matches lakehouse partition-overwrite behavior; keeps run -> tweak -> run fast.
+- Alternatives: Refuse overwrite (tedious); run_id in filenames (breaks ADR-0004).
+- Impact: csv_writer. Atomic writes planned Phase 3.
 
 ## ADR-0014 - Generation order and FK-by-parent-id-range
-- Decision: Entities are generated in dependency order (parents before children): customer, supplier -> product -> (3b: employee, order, order_item, payment). A child generator receives the parent record count in its constructor and picks FK values from its own seeded rng over 1..parent_count. Dataset composition rules (e.g. product requires supplier) are validated in main.py before any file is written.
-- Why: With sequential PKs (ADR-0001), parent ids are exactly 1..N, so a child can guarantee referential integrity WITHOUT holding parent records in memory - deterministic and scale-friendly (works at 100M rows too).
-- Alternatives: Pass actual parent id lists (memory-heavy at scale); post-hoc FK fixing (violates 'correct by construction'); global shared context object (premature - revisit if entities need parent ATTRIBUTES, not just ids).
-- Impact: All future child generators; main.py generation blocks ordered by dependency; registry-based dispatch refactor planned for 3b when entity count grows.
+- Decision: Parents generated before children; child generators receive parent counts and pick FKs from 1..parent_count with their own seeded rng; composition rules validated in main.py.
+- Why: Sequential PKs make integrity correct by construction, memory-light, scale-friendly.
+- Alternatives: Passing parent id lists for id-only FKs (memory-heavy); post-hoc repair (rejected).
+- Impact: All child generators; main.py ordering.
+
+## ADR-0015 - Generation context (parent attributes)
+- Decision: When a business rule needs parent ATTRIBUTES (not just ids), main.py extracts explicit tuples/dicts from generated parent records (e.g. customer (id, registration_date), product (id, unit_price), per-order totals) and passes them to the child generator constructor. Generators never import each other.
+- Why: Rules like order_date >= registration_date and item price = product price are impossible from id ranges alone; explicit wiring keeps generators decoupled and testable.
+- Alternatives: Generators reading other generators (coupling); a global registry object (premature); post-hoc data repair (violates correct-by-construction).
+- Impact: main.py holds parent lists in memory (fine at thousands of rows; Phase 7 will stream/aggregate at scale). All future attribute-dependent generators follow this pattern.
+
+## ADR-0016 - Business rules at generation time
+- Decision: Rules are encoded in generators, not checked afterwards: order_date >= customer registration_date; every order >= 1 item (first N items map to orders 1..N); item unit_price = product unit_price; quantity 1..5; payment only for completed orders, sampled without replacement (<= 1 per order); payment_date >= order_date; payment.amount = order item total. Cross-dataset count rules enforced in main.py (order_item.records >= order.records); impossible requests raise ValueError loudly.
+- Why: Data that is valid by construction is the platform's core value; downstream projects then practice VALIDATING these rules rather than fighting noise.
+- Alternatives: Separate validation layer that repairs data (deferred to Phase 4 impurity engine, which will deliberately BREAK these rules under controlled config).
+- Impact: generators/order*, payment; tests assert each rule; Phase 4 impurity engine will target exactly these invariants.

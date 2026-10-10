@@ -15,20 +15,20 @@ Relative paths resolve against the project root (ADR-0010).
 | output.format             | str  | yes               | Currently only: csv                                   |
 
 ## History (ADR-0012)
+Window for historical dates: [reference_date - history_days, reference_date].
+Forms: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'; fixed units (y=365d, m=30d).
 
-`generation.history` controls how far back generated history extends. The
-window for historical dates is [reference_date - history_days, reference_date].
-Accepted forms: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'.
-Units are fixed lengths (y=365d, m=30d) so config + seed stays deterministic.
-
-## Dataset composition rules
-
-- product requires supplier in datasets (FK dependency, ADR-0014).
-  Violations raise ConfigError before anything is written.
+## Dataset composition rules (ADR-0014/0016)
+- product requires supplier
+- order requires customer and employee
+- order_item requires order and product; order_item.records >= order.records
+- payment requires order and order_item; payment.records must not exceed the
+  number of completed orders (~70% of order.records with the default split) -
+  otherwise a ValueError stops the run loudly.
 
 ## Error behavior
-Missing or invalid keys raise ConfigError with a specific message; the run
-stops before any file is written.
+Invalid config raises ConfigError before any file is written; rule violations
+during generation raise ValueError and are logged by run() with exit code 1.
 
 ## Known datasets
-customer, supplier, product (Milestone 3b adds employee, order, order_item, payment).
+customer, supplier, product, employee, order, order_item, payment.
