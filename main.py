@@ -1,9 +1,12 @@
 """Entry point - wires the stages together. No business logic lives here.
 
 Pipeline: config -> seed -> generate -> write -> manifest.
+Failures are logged to the run log and reported via process exit codes:
+  0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
 """
 
 import logging
+import sys
 import time
 from pathlib import Path
 
@@ -27,6 +30,7 @@ KNOWN_DATASETS = {"customer"}
 
 
 def main() -> None:
+    """Run the full pipeline. Raises on any failure - run() handles logging."""
     start = time.perf_counter()
     configure_logging()
 
@@ -78,5 +82,32 @@ def main() -> None:
     )
 
 
+def run() -> int:
+    """Entry wrapper: converts crashes into logged failures and exit codes.
+
+    This is the ONLY place allowed to catch broadly: its job is to make sure
+    every failure is recorded in the run log before the process dies.
+    Nothing is swallowed - the full traceback is logged, then the process
+    exits non-zero so scripts and schedulers can detect the failure.
+
+    Exit codes: 0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
+    """
+    try:
+        main()
+        return 0
+    except KeyboardInterrupt:
+        # Ctrl+C during a long run is a user decision, not an error.
+        # (Will matter in Phase 7 when runs get long.)
+        logger.warning("[SUMMARY] status=interrupted (Ctrl+C)")
+        return 130
+    except Exception as exc:
+        # logger.exception must be called inside an except block:
+        # it logs at ERROR level and automatically appends the full traceback,
+        # so the complete failure story lands in the run log file.
+        logger.exception("[SUMMARY] status=failed error=%s: %s",
+                         type(exc).__name__, exc)
+        return 1
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(run())

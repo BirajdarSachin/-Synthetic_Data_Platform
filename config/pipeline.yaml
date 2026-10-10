@@ -11,7 +11,7 @@ generation:
 
 datasets:
   customer:
-    records: 1000
+    records: 2000
 
 output:
   directory: data/generated   # resolved against project root (ADR-0010)
