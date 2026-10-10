@@ -20,6 +20,9 @@ def write_csv(file_path: Path, records: Iterable[Any]) -> int:
 
     Raises ValueError when records is empty - we never write a silent,
     header-only file.
+    Raises PermissionError with an actionable message when the target file
+    is locked by another program (e.g. Excel holding a previous run's
+    output open).
     """
     iterator = iter(records)
     try:
@@ -31,8 +34,17 @@ def write_csv(file_path: Path, records: Iterable[Any]) -> int:
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     count = 0
-    # newline="" is required by the csv module to avoid blank lines on Windows.
-    with file_path.open("w", encoding="utf-8", newline="") as handle:
+    try:
+        # newline="" is required by the csv module to avoid blank lines on Windows.
+        handle = file_path.open("w", encoding="utf-8", newline="")
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Output file is locked and cannot be written: {file_path}. "
+            "It is most likely open in another program (Excel, LibreOffice, "
+            "Power BI). Close that program and run again."
+        ) from exc
+
+    with handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for record in chain([first], iterator):
