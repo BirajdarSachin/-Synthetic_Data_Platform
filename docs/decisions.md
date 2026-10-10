@@ -55,4 +55,16 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Decision: stdlib logging only (never print). One logger per module via logging.getLogger(__name__). Console = INFO; per-run file logs/run_<run_id>.log = DEBUG. Message format "[STAGE] message key=value". Stage tags: STARTUP, CONFIG, SEED, GENERATION, WRITER, MANIFEST, SUMMARY. configure_logging() called once, in main.py.
 - Why: Logging conventions are a contract; consistent tags make runs greppable; per-run files pair with the future manifest via run_id.
 - Alternatives: print (no levels/files/structure); structlog/JSON logging (deferred until machine-parsing is needed); loguru (external dep without need).
-- Impact: Every module from Milestone 2 on. Stage contents: STARTUP (run_id, version, python, platform, cwd, log_file) - now; CONFIG (config path, resolved values, output dir); SEED (master + child seeds); GENERATION (entity, counts, duration); WRITER (output dir, files, sizes); MANIFEST (path); SUMMARY (totals) - from Milestone 2. Rules: no per-record INFO logging; lazy %-formatting; no secrets.
+- Impact: Every module from Milestone 2 on. Rules: no per-record INFO logging; lazy %-formatting; no secrets.
+
+## ADR-0010 - Relative paths resolve against the project root
+- Decision: All relative paths from configuration resolve against the project root (parent of src/), via src/core/paths.py. The cwd is logged at startup for forensics but never used for resolution.
+- Why: A run must behave identically no matter where it was started from; resolving against cwd causes "files landed in the wrong place" bugs.
+- Alternatives: Resolve against cwd (rejected: behavior varies by launch location); require absolute paths (rejected: not portable).
+- Impact: src/core/paths.py; config loading; all future writers and scripts.
+
+## ADR-0011 - Output directory layout
+- Decision: Generated datasets live in data/generated/ as {entity}_{date}.{format}; run manifests live in data/generated/_manifests/run_<run_id>.json.
+- Why: One predictable layout is a contract downstream projects rely on; a separate _manifests/ folder keeps metadata out of data-file glob patterns.
+- Alternatives: Manifests next to data files (pollutes globs); manifests under logs/ (mixes human logs with machine metadata).
+- Impact: src/metadata/manifest.py, main.py; all future phases keep this layout.
