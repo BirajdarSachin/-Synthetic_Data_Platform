@@ -1,8 +1,11 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Pipeline: config -> seed -> generate -> write -> manifest.
 Generation order follows FK dependencies (ADR-0014):
-customer (independent) -> supplier (independent) -> product (needs supplier).
+  customer, supplier, employee (independent)
+    -> product (needs supplier count)
+    -> order (needs customer DATES + employee count, ADR-0015 context)
+    -> order_item (needs order count + product prices)
+    -> payment (needs completed orders + item totals)
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
 """
@@ -10,6 +13,7 @@ Failures are logged to the run log and reported via exit codes:
 import logging
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 
 from src.core.config import ConfigError, load_config
@@ -17,6 +21,10 @@ from src.core.logging_setup import configure_logging, get_run_id
 from src.core.paths import resolve_path
 from src.core.seed_manager import SeedManager
 from src.generators.customer import CustomerGenerator
+from src.generators.employee import EmployeeGenerator
+from src.generators.order import OrderGenerator
+from src.generators.order_item import OrderItemGenerator
+from src.generators.payment import PaymentGenerator
 from src.generators.product import ProductGenerator
 from src.generators.supplier import SupplierGenerator
 from src.metadata.manifest import (
@@ -25,14 +33,27 @@ from src.metadata.manifest import (
     write_manifest,
 )
 from src.models.customer import SCHEMA_VERSION as CUSTOMER_SCHEMA_VERSION
+from src.models.employee import SCHEMA_VERSION as EMPLOYEE_SCHEMA_VERSION
+from src.models.order import SCHEMA_VERSION as ORDER_SCHEMA_VERSION
+from src.models.order_item import SCHEMA_VERSION as ORDER_ITEM_SCHEMA_VERSION
+from src.models.payment import SCHEMA_VERSION as PAYMENT_SCHEMA_VERSION
 from src.models.product import SCHEMA_VERSION as PRODUCT_SCHEMA_VERSION
 from src.models.supplier import SCHEMA_VERSION as SUPPLIER_SCHEMA_VERSION
 from src.writers.csv_writer import write_csv
 
 logger = logging.getLogger(__name__)
 
-# Datasets this build of the platform knows how to generate.
-KNOWN_DATASETS = {"customer", "supplier", "product"}
+KNOWN_DATASETS = {
+    "customer", "supplier", "product", "employee", "order", "order_item", "payment",
+}
+
+# ADR-0014/0016: a child entity requires its parents in the same config.
+COMPOSITION_RULES = {
+    "product": ["supplier"],
+    "order": ["customer", "employee"],
+    "order_item": ["order", "product"],
+    "payment": ["order", "order_item"],
+}
 
 
 def _entity_file_path(config, entity: str) -> Path:
@@ -40,6 +61,44 @@ def _entity_file_path(config, entity: str) -> Path:
     return config.output.directory / (
         f"{entity}_{config.generation.reference_date}.{config.output.format}"
     )
+
+
+def _validate_composition(config) -> None:
+    unknown = set(config.datasets) - KNOWN_DATASETS
+    if unknown:
+        raise ConfigError(f"Unknown dataset(s) in config: {sorted(unknown)}. "
+                          f"Known: {sorted(KNOWN_DATASETS)}")
+    for child, parents in COMPOSITION_RULES.items():
+        if child in config.datasets:
+            missing = [p for p in parents if p not in config.datasets]
+            if missing:
+                raise ConfigError(
+                    f"{child} requires {missing} in datasets "
+                    "(referential integrity, ADR-0014)"
+                )
+    if ("order_item" in config.datasets and "order" in config.datasets
+            and config.datasets["order_item"].records
+            < config.datasets["order"].records):
+        raise ConfigError(
+            "order_item.records must be >= order.records "
+            "(every order needs at least one item, ADR-0016)"
+        )
+
+
+def _run_entity(config, generator, schema_version: str, child_seed: int) -> tuple[list, dict]:
+    """Generate, write and build manifest info for one entity. Returns (records, info)."""
+    cfg = config.datasets[generator.ENTITY]
+    file_path = _entity_file_path(config, generator.ENTITY)
+    records = list(generator.generate(cfg.records))
+    count = write_csv(file_path, records)
+    info = build_dataset_info(
+        entity=generator.ENTITY,
+        schema_version=schema_version,
+        records=count,
+        file_path=file_path,
+        child_seed=child_seed,
+    )
+    return records, info
 
 
 def main() -> None:
@@ -50,68 +109,95 @@ def main() -> None:
     config = load_config(resolve_path(Path("config/pipeline.yaml")))
     seeds = SeedManager(config.run.seed)
     logger.info("[WRITER] output_dir=%s", config.output.directory)
-
-    unknown = set(config.datasets) - KNOWN_DATASETS
-    if unknown:
-        raise ConfigError(f"Unknown dataset(s) in config: {sorted(unknown)}. "
-                          f"Known: {sorted(KNOWN_DATASETS)}")
-    # Dataset composition rule: a child entity requires its parent in config.
-    if "product" in config.datasets and "supplier" not in config.datasets:
-        raise ConfigError("product requires supplier in datasets "
-                          "(referential integrity, ADR-0014)")
+    _validate_composition(config)
 
     datasets: dict[str, dict] = {}
+    facts: dict = {}
 
     if "customer" in config.datasets:
-        cfg = config.datasets["customer"]
-        child_seed = seeds.child_seed(CustomerGenerator.ENTITY)
-        generator = CustomerGenerator(
-            seed=child_seed,
+        seed = seeds.child_seed(CustomerGenerator.ENTITY)
+        gen = CustomerGenerator(
+            seed=seed,
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        file_path = _entity_file_path(config, CustomerGenerator.ENTITY)
-        records = write_csv(file_path, generator.generate(cfg.records))
-        datasets["customer"] = build_dataset_info(
-            entity=CustomerGenerator.ENTITY,
-            schema_version=CUSTOMER_SCHEMA_VERSION,
-            records=records, file_path=file_path, child_seed=child_seed,
-        )
+        customers, info = _run_entity(config, gen, CUSTOMER_SCHEMA_VERSION, seed)
+        datasets["customer"] = info
+        facts["customers"] = [(c.customer_id, c.registration_date) for c in customers]
 
     if "supplier" in config.datasets:
-        cfg = config.datasets["supplier"]
-        child_seed = seeds.child_seed(SupplierGenerator.ENTITY)
-        generator = SupplierGenerator(seed=child_seed)
-        file_path = _entity_file_path(config, SupplierGenerator.ENTITY)
-        records = write_csv(file_path, generator.generate(cfg.records))
-        datasets["supplier"] = build_dataset_info(
-            entity=SupplierGenerator.ENTITY,
-            schema_version=SUPPLIER_SCHEMA_VERSION,
-            records=records, file_path=file_path, child_seed=child_seed,
-        )
+        seed = seeds.child_seed(SupplierGenerator.ENTITY)
+        gen = SupplierGenerator(seed=seed)
+        _, info = _run_entity(config, gen, SUPPLIER_SCHEMA_VERSION, seed)
+        datasets["supplier"] = info
 
     if "product" in config.datasets:
-        cfg = config.datasets["product"]
-        child_seed = seeds.child_seed(ProductGenerator.ENTITY)
-        generator = ProductGenerator(
-            seed=child_seed,
+        seed = seeds.child_seed(ProductGenerator.ENTITY)
+        gen = ProductGenerator(
+            seed=seed,
             supplier_count=config.datasets["supplier"].records,
         )
-        file_path = _entity_file_path(config, ProductGenerator.ENTITY)
-        records = write_csv(file_path, generator.generate(cfg.records))
-        datasets["product"] = build_dataset_info(
-            entity=ProductGenerator.ENTITY,
-            schema_version=PRODUCT_SCHEMA_VERSION,
-            records=records, file_path=file_path, child_seed=child_seed,
+        products, info = _run_entity(config, gen, PRODUCT_SCHEMA_VERSION, seed)
+        datasets["product"] = info
+        facts["products"] = [(p.product_id, p.unit_price) for p in products]
+
+    if "employee" in config.datasets:
+        seed = seeds.child_seed(EmployeeGenerator.ENTITY)
+        gen = EmployeeGenerator(
+            seed=seed,
+            reference_date=config.generation.reference_date,
+            history_days=config.generation.history_days,
         )
+        _, info = _run_entity(config, gen, EMPLOYEE_SCHEMA_VERSION, seed)
+        datasets["employee"] = info
+
+    if "order" in config.datasets:
+        seed = seeds.child_seed(OrderGenerator.ENTITY)
+        gen = OrderGenerator(
+            seed=seed,
+            reference_date=config.generation.reference_date,
+            customers=facts["customers"],
+            employee_count=config.datasets["employee"].records,
+        )
+        orders, info = _run_entity(config, gen, ORDER_SCHEMA_VERSION, seed)
+        datasets["order"] = info
+        facts["completed_orders"] = [
+            (o.order_id, o.order_date) for o in orders if o.status == "completed"
+        ]
+
+    if "order_item" in config.datasets:
+        seed = seeds.child_seed(OrderItemGenerator.ENTITY)
+        gen = OrderItemGenerator(
+            seed=seed,
+            order_count=config.datasets["order"].records,
+            products=facts["products"],
+        )
+        items, info = _run_entity(config, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
+        datasets["order_item"] = info
+        totals: dict[int, Decimal] = {}
+        for item in items:
+            totals[item.order_id] = (
+                totals.get(item.order_id, Decimal("0.00"))
+                + item.quantity * item.unit_price
+            )
+        facts["totals"] = totals
+
+    if "payment" in config.datasets:
+        seed = seeds.child_seed(PaymentGenerator.ENTITY)
+        gen = PaymentGenerator(
+            seed=seed,
+            reference_date=config.generation.reference_date,
+            completed_orders=facts["completed_orders"],
+            totals=facts["totals"],
+        )
+        _, info = _run_entity(config, gen, PAYMENT_SCHEMA_VERSION, seed)
+        datasets["payment"] = info
 
     manifest = build_run_header(
         run_id=get_run_id(), config=config, duration_s=time.perf_counter() - start
     )
     manifest["datasets"] = datasets
-    manifest_path = (
-        config.output.directory / "_manifests" / f"{get_run_id()}.json"
-    )
+    manifest_path = config.output.directory / "_manifests" / f"{get_run_id()}.json"
     write_manifest(manifest_path, manifest)
 
     total_records = sum(d["records"] for d in datasets.values())
@@ -122,12 +208,7 @@ def main() -> None:
 
 
 def run() -> int:
-    """Entry wrapper: converts crashes into logged failures and exit codes.
-
-    The ONLY place allowed to catch broadly: every failure must be recorded
-    in the run log before the process dies. Exit codes: 0 success, 1 failure,
-    130 interrupted.
-    """
+    """Entry wrapper: converts crashes into logged failures and exit codes."""
     try:
         main()
         return 0

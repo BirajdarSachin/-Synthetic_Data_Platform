@@ -15,6 +15,15 @@ datasets:
     records: 50               # generated BEFORE product (ADR-0014 order)
   product:
     records: 300              # FK: supplier_id in 1..supplier.records
+  employee:
+    records: 20               # independent; FK target of order.sales_rep_employee_id
+  order:
+    records: 5000             # FK: customer_id, sales_rep_employee_id (ADR-0015/0016)
+  order_item:
+    records: 12000            # MUST be >= order.records (every order >= 1 item, ADR-0016)
+  payment:
+    records: 3000             # sampled from COMPLETED orders only; must not
+                              # exceed their count (~70% of orders), ADR-0016
 
 output:
   directory: data/generated   # resolved against project root (ADR-0010)
