@@ -1,0 +1,16 @@
+# Pipeline configuration - the contract for one generation run.
+# Relative paths are resolved against the project root (ADR-0010).
+
+run:
+  seed: 12345                 # master seed - drives all randomness (ADR-0006)
+
+generation:
+  reference_date: 2026-01-15  # simulated "today" for generated data (ADR-0003)
+
+datasets:
+  customer:
+    records: 1000
+
+output:
+  directory: data/generated   # resolved against project root (ADR-0010)
+  format: csv

@@ -1,2 +1,5 @@
-# Milestone 1: standard library only - no dependencies.
-# Dependencies are added only when a milestone needs them (see docs/decisions.md).
+# Milestone 2 dependencies. Exact pinning happens in Phase 8 (packaging);
+# the run manifest records the faker version actually used per run.
+faker>=20.0
+pyyaml>=6.0
+pytest>=8.0
