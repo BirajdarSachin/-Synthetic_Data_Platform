@@ -46,7 +46,7 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Impact: All models; manifests.
 
 ## ADR-0008 - Configuration format
-- Decision: YAML validated into typed frozen dataclasses.
+- Decision: YAML validated...
 - Why: Readable, comment-friendly, diffable.
 - Alternatives: JSON, TOML.
 - Impact: config/ + loader.
@@ -104,3 +104,9 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Why: The second format (JSON) made the promised abstraction earn its place (deferred since Milestone 2). The template method removes four duplicated concerns before they drift. NDJSON streams line by line - flat memory, line-readable by Spark/pandas/stream consumers, truncation-tolerant - unlike a single JSON array which forces whole-file parsing. One serialization module keeps ADR-0002/0003 rules identical across formats.
 - Alternatives: Single JSON array (rejected: no streaming); pandas.to_json (rejected: pandas stays out of core, ADR-0005); per-writer serialization (rejected: drift risk); typing.Protocol instead of ABC (equally valid; ABC chosen for a clear contract and shared hooks).
 - Impact: config accepts output.format: csv|json; file extension follows format via ADR-0004; future writers (parquet, avro, db) implement Writer; atomic writes will land inside the shared lifecycle and benefit every format at once.
+
+## ADR-0018 - Native Parquet serialization
+- Decision: Parquet preserves native field values: dates remain dates(Arrow date32[day]) and Decimal money remains decimal. serialization.py ownsboth policies: serialize_record() converts values for text formats;native_record() preserves values for typed formats. The Arrow schema isPINNED, derived from the first record's dataclass annotations(int -> int64, str -> string, date -> date32, Decimal -> decimal128(12, 2));ParquetWriter opens a binary handle and writes viapa.Table.from_pandas(frame, schema=...) and pq.write_table.
+- Why: ADR-0002 requires DECIMAL semantics for money; native date and decimalcolumns enable warehouse type checks and predicate pushdown. Pinning isrequired because pyarrow infers decimal precision from the values present(spike: unit_price 5.00-2000.00 inferred decimal128(6, 2)); a differentgeneration config would produce a different column type - schema drift,which ADR-0007 exists to prevent. Deriving the schema from the dataclasskeeps the model the single schema contract.
+- Alternatives: Reuse text serialization (rejected: dates and money becomestrings - the anti-pattern this milestone exists to eliminate); let pyarrowinfer the full schema (rejected: inferred precision varies with generationparameters); per-writer conversion policy (rejected: duplicates formatpolicy outside the shared serialization module); text-handle .bufferreach-through (rejected: bypasses the writer file-handle contract); typemapping in serialization.py (rejected: would put the pyarrow import on theCSV/JSON path).
+- Impact: CSV/JSON keep ADR-0017 text representations. Partially supersedesADR-0017's statement that text serialization is "used by every writer".The base Writer is generic over text and binary handles. Parquetmaterializes records in memory; chunked writing deferred to Phase 7.Hive partitions and atomic writes remain open (Milestone 4c).

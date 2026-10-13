@@ -89,3 +89,4 @@ def test_config_accepts_json_format(tmp_path: Path):
     )
     config = load_config(config_file)
     assert config.output.format == "json"
+

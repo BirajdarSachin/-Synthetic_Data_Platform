@@ -12,7 +12,7 @@ Relative paths resolve against the project root (ADR-0010).
 | generation.history        | str  | no (default "3y") | Duration: '30d', '4m', '2y', '10y', '1y6m' (ADR-0012) |
 | datasets.<name>.records   | int  | yes               | >= 1                                                  |
 | output.directory          | str  | yes               | Relative to project root                              |
-| output.format             | str  | yes               | csv \| json (ADR-0017); file extension follows format |
+| output.format             | str  | yes               | csv \| json \| parquet (ADR-0017); extension follows format |
 
 ## History (ADR-0012)
 Window for historical dates: [reference_date - history_days, reference_date].

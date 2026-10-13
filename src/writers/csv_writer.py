@@ -16,7 +16,7 @@ from src.writers.serialization import serialize_record
 logger = logging.getLogger(__name__)
 
 
-class CsvWriter(Writer):
+class CsvWriter(Writer[TextIO]):
     """Writes records as CSV: header + one row per record, UTF-8."""
 
     def _open_file(self, file_path: Path) -> TextIO:

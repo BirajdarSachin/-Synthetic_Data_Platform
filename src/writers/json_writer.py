@@ -17,7 +17,7 @@ from src.writers.serialization import serialize_record
 logger = logging.getLogger(__name__)
 
 
-class JsonWriter(Writer):
+class JsonWriter(Writer[TextIO]):
     """Writes records as newline-delimited JSON."""
 
     def _write_records(self, handle: TextIO, records: Iterator[Any]) -> int:

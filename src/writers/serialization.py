@@ -1,9 +1,7 @@
-"""Shared record serialization - the single source of truth for cell values.
+"""Shared record serialization policies for text and typed output formats.
 
-Every writer converts dataclass field values through these functions, so a
-date or a monetary amount looks the same in CSV and JSON
-(ADR-0002: Decimal money as 2dp strings; ADR-0003: dates as ISO-8601).
-Adding a new value type HERE updates every format at once.
+CSV/JSON use text serialization; typed formats such as Parquet preserve
+native values so dates and Decimal money retain their logical types.
 """
 
 from dataclasses import asdict
@@ -22,8 +20,13 @@ def serialize_cell(value: Any) -> Any:
 
 
 def serialize_record(record: Any) -> dict[str, Any]:
-    """Convert a dataclass record to a dict of output-ready values."""
+    """Convert a dataclass record to text-format output values."""
     return {
         key: serialize_cell(value)
         for key, value in asdict(record).items()
     }
+
+
+def native_record(record: Any) -> dict[str, Any]:
+    """Convert a dataclass record to a dict while preserving native field types."""
+    return asdict(record)

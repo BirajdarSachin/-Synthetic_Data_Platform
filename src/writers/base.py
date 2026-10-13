@@ -13,12 +13,14 @@ import logging
 from abc import ABC, abstractmethod
 from itertools import chain
 from pathlib import Path
-from typing import Any, Iterable, Iterator, TextIO
+from typing import Any, BinaryIO, Generic, Iterable, Iterator, TextIO, TypeVar, cast
 
 logger = logging.getLogger(__name__)
 
+Handle = TypeVar("Handle", TextIO, BinaryIO)
 
-class Writer(ABC):
+
+class Writer(ABC, Generic[Handle]):
     """Writes dataclass records to one file in one specific format.
 
     Contract (ADR-0017):
@@ -27,8 +29,8 @@ class Writer(ABC):
       * Raises ValueError on an empty stream - never write a silent file.
       * Raises PermissionError with an actionable message when the target
         file is locked by another program.
-      * Cell serialization rules come from serialization.py - identical
-        across all formats (ADR-0002, ADR-0003).
+      * Format-specific serialization policies come from serialization.py
+        (ADR-0018).
     """
 
     def write(self, file_path: Path, records: Iterable[Any]) -> int:
@@ -60,11 +62,11 @@ class Writer(ABC):
                     file_path, count, file_path.stat().st_size)
         return count
 
-    def _open_file(self, file_path: Path) -> TextIO:
-        """Hook: how the format opens its text handle. CSV overrides this."""
-        return file_path.open("w", encoding="utf-8", newline="\n")
+    def _open_file(self, file_path: Path) -> Handle:
+        """Hook: open a format-specific text or binary output handle."""
+        return cast(Handle, file_path.open("w", encoding="utf-8", newline="\n"))
 
     @abstractmethod
-    def _write_records(self, handle: TextIO, records: Iterator[Any]) -> int:
+    def _write_records(self, handle: Handle, records: Iterator[Any]) -> int:
         """Format-specific: write every record (including the first) to the
         open handle. Returns the record count."""

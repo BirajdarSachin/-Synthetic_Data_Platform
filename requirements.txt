@@ -3,3 +3,6 @@
 faker>=20.0
 pyyaml>=6.0
 pytest>=8.0
+# Parquet output uses pandas with the PyArrow engine.
+pandas>=2.2
+pyarrow>=18.0
