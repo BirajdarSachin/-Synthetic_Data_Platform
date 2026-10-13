@@ -1,16 +1,10 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Pipeline: config -> seed -> generate -> write (format from config, ADR-0017)
-          -> manifest.
-Generation order follows FK dependencies (ADR-0014):
-  customer, supplier, employee (independent)
-    -> product (needs supplier count)
-    -> order (needs customer DATES + employee count, ADR-0015 context)
-    -> order_item (needs order count + product prices)
-    -> review (completed orders + purchased order items)
-    -> payment (needs completed orders + item totals)
+Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021)
+          -> write (format from config, ADR-0017) -> manifest.
+Generation order follows FK dependencies (ADR-0014); context (ADR-0015) is
+always extracted from CLEAN records - corruption is local to written files.
 Output layout is Hive-style (ADR-0019); writes are atomic (ADR-0020).
-main.py selects the Writer via the factory and never imports concrete writers.
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
 """
@@ -46,6 +40,7 @@ from src.models.payment import SCHEMA_VERSION as PAYMENT_SCHEMA_VERSION
 from src.models.product import SCHEMA_VERSION as PRODUCT_SCHEMA_VERSION
 from src.models.review import SCHEMA_VERSION as REVIEW_SCHEMA_VERSION
 from src.models.supplier import SCHEMA_VERSION as SUPPLIER_SCHEMA_VERSION
+from src.quality.engine import ImpurityEngine
 from src.writers import get_writer
 
 logger = logging.getLogger(__name__)
@@ -64,11 +59,13 @@ COMPOSITION_RULES = {
     "review": ["order", "order_item"],
 }
 
+# ADR-0021: corrupted runs must never overwrite the clean baseline.
+_CLEAN_BASELINE = resolve_path(Path("data/generated"))
+
 
 def _entity_file_path(config, entity: str) -> Path:
     """Hive-style layout (ADR-0019):
-    {entity}/reference_date={date}/{entity}_{date}.{format}
-    The date stays in the file name so ADR-0004's naming contract holds."""
+    {entity}/reference_date={date}/{entity}_{date}.{format}"""
     ref = config.generation.reference_date
     partition = f"reference_date={ref.isoformat()}"
     file_name = f"{entity}_{ref.isoformat()}.{config.output.format}"
@@ -97,13 +94,35 @@ def _validate_composition(config) -> None:
         )
 
 
-def _run_entity(config, writer, generator, schema_version: str,
+def _validate_quality_output(config) -> None:
+    """ADR-0021 guard: quality runs must target a separate output directory."""
+    if config.quality is None:
+        return
+    unknown = set(config.quality.datasets) - KNOWN_DATASETS
+    if unknown:
+        raise ConfigError(
+            f"quality.datasets contains unknown dataset(s): {sorted(unknown)}"
+        )
+    if config.output.directory == _CLEAN_BASELINE:
+        raise ConfigError(
+            "quality is active but output.directory is the clean baseline "
+            "(data/generated). Set output.directory: data/corrupted so "
+            "corrupted runs never overwrite clean datasets (ADR-0021)"
+        )
+
+
+def _run_entity(config, writer, engine, generator, schema_version: str,
                 child_seed: int) -> tuple[list, dict]:
-    """Generate, write and build manifest info for one entity. Returns (records, info)."""
+    """Generate, (optionally) corrupt, write; build manifest info.
+
+    Returns the CLEAN records so facts/context extraction (ADR-0015) never
+    sees corrupted values - corruption is local to written files (ADR-0021).
+    """
     cfg = config.datasets[generator.ENTITY]
     file_path = _entity_file_path(config, generator.ENTITY)
     records = list(generator.generate(cfg.records))
-    count = writer.write(file_path, records)
+    stream = engine.apply(generator.ENTITY, iter(records)) if engine else iter(records)
+    count = writer.write(file_path, stream)
     info = build_dataset_info(
         entity=generator.ENTITY,
         schema_version=schema_version,
@@ -123,9 +142,11 @@ def main() -> None:
     config = load_config(resolve_path(Path("config/pipeline.yaml")))
     seeds = SeedManager(config.run.seed)
     writer = get_writer(config.output.format)
+    engine = ImpurityEngine(seeds, config.quality) if config.quality else None
     logger.info("[WRITER] output_dir=%s format=%s writer=%s",
                 config.output.directory, config.output.format, type(writer).__name__)
     _validate_composition(config)
+    _validate_quality_output(config)
 
     datasets: dict[str, dict] = {}
     facts: dict = {}
@@ -138,14 +159,14 @@ def main() -> None:
             history_days=config.generation.history_days,
         )
         customers, info = _run_entity(
-            config, writer, gen, CUSTOMER_SCHEMA_VERSION, seed)
+            config, writer, engine, gen, CUSTOMER_SCHEMA_VERSION, seed)
         datasets["customer"] = info
         facts["customers"] = [(c.customer_id, c.registration_date) for c in customers]
 
     if "supplier" in config.datasets:
         seed = seeds.child_seed(SupplierGenerator.ENTITY)
         gen = SupplierGenerator(seed=seed)
-        _, info = _run_entity(config, writer, gen, SUPPLIER_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, engine, gen, SUPPLIER_SCHEMA_VERSION, seed)
         datasets["supplier"] = info
 
     if "product" in config.datasets:
@@ -155,7 +176,7 @@ def main() -> None:
             supplier_count=config.datasets["supplier"].records,
         )
         products, info = _run_entity(
-            config, writer, gen, PRODUCT_SCHEMA_VERSION, seed)
+            config, writer, engine, gen, PRODUCT_SCHEMA_VERSION, seed)
         datasets["product"] = info
         facts["products"] = [(p.product_id, p.unit_price) for p in products]
 
@@ -166,7 +187,7 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        _, info = _run_entity(config, writer, gen, EMPLOYEE_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, engine, gen, EMPLOYEE_SCHEMA_VERSION, seed)
         datasets["employee"] = info
 
     if "order" in config.datasets:
@@ -177,7 +198,7 @@ def main() -> None:
             customers=facts["customers"],
             employee_count=config.datasets["employee"].records,
         )
-        orders, info = _run_entity(config, writer, gen, ORDER_SCHEMA_VERSION, seed)
+        orders, info = _run_entity(config, writer, engine, gen, ORDER_SCHEMA_VERSION, seed)
         datasets["order"] = info
         facts["completed_orders"] = [
             (o.order_id, o.order_date) for o in orders if o.status == "completed"
@@ -191,7 +212,7 @@ def main() -> None:
             products=facts["products"],
         )
         items, info = _run_entity(
-            config, writer, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
+            config, writer, engine, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
         datasets["order_item"] = info
         totals: dict[int, Decimal] = {}
         for item in items:
@@ -221,7 +242,7 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             purchases=facts["purchases"],
         )
-        _, info = _run_entity(config, writer, gen, REVIEW_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, engine, gen, REVIEW_SCHEMA_VERSION, seed)
         datasets["review"] = info
 
     if "payment" in config.datasets:
@@ -232,13 +253,21 @@ def main() -> None:
             completed_orders=facts["completed_orders"],
             totals=facts["totals"],
         )
-        _, info = _run_entity(config, writer, gen, PAYMENT_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, engine, gen, PAYMENT_SCHEMA_VERSION, seed)
         datasets["payment"] = info
 
     manifest = build_run_header(
         run_id=get_run_id(), config=config, duration_s=time.perf_counter() - start
     )
     manifest["datasets"] = datasets
+    if config.quality is not None:
+        manifest["quality"] = {
+            "null_rate": config.quality.null_rate,
+            "datasets": {
+                name: list(spec.null_fields)
+                for name, spec in config.quality.datasets.items()
+            },
+        }
     manifest_path = config.output.directory / "_manifests" / f"{get_run_id()}.json"
     write_manifest(manifest_path, manifest)
 
@@ -246,6 +275,25 @@ def main() -> None:
     logger.info(
         "[SUMMARY] datasets=%s records=%s duration_s=%.2f status=success",
         len(datasets), total_records, time.perf_counter() - start,
+    )
+
+
+def _fake_config_for_guard_test(quality, directory: Path):
+    """Test hook: build a minimal config for the guard test only."""
+    from src.core.config import (
+        DatasetConfig,
+        GenerationConfig,
+        OutputConfig,
+        PipelineConfig,
+        RunConfig,
+    )
+    return PipelineConfig(
+        config_file=Path("pipeline.yaml"),
+        run=RunConfig(seed=1),
+        generation=GenerationConfig(reference_date=Path("x") and __import__("datetime").date(2026, 1, 15), history_days=365),
+        datasets={"customer": DatasetConfig(name="customer", records=1)},
+        output=OutputConfig(directory=directory, format="csv"),
+        quality=quality,
     )
 
 

@@ -3,53 +3,53 @@
 ## Target pipeline (stable shape - do not change casually)
 config (YAML) -> orchestration -> generators -> impurity engine (optional) -> writers -> run manifest
 
-## Current state (end of Milestone 4c)
+## Current state (end of Milestone 5a)
 config/pipeline.yaml
     | [CONFIG]
     v
 src/core/config.py           typed, validated config (ADR-0008)
     | [SEED]
     v
-src/core/seed_manager.py     master seed -> child seed per entity (ADR-0006)
+src/core/seed_manager.py     master seed -> child seeds (entities + quality, ADR-0006/0021)
     | [GENERATION]
     v
 generators in FK order (ADR-0014), fed context by main.py (ADR-0015)
-    | [WRITER]
+    | context extracted from CLEAN records only
+    v
+src/quality/engine.py        ImpurityEngine (optional; ADR-0021)  [QUALITY]
+    | passthrough when no quality config
     v
 main.py path builder: {entity}/reference_date={date}/{entity}_{date}.{fmt} (ADR-0019)
     |
 src/writers/__init__.py      get_writer(format) factory (ADR-0017)
-    |                             |
-    v                             v
-CsvWriter (csv)          JsonWriter (ndjson)     ParquetWriter (parquet)
-              all extend Writer ABC; ALL WRITES ATOMIC (ADR-0020)
+    |
+CsvWriter / JsonWriter / ParquetWriter - all extend Writer ABC; ATOMIC (ADR-0020)
     | [MANIFEST]
     v
-src/metadata/manifest.py     manifest v2: _manifests/run_<run_id>.json (ADR-0011, ADR-0019)
+src/metadata/manifest.py     manifest v2 + optional quality record (ADR-0011/0019/0021)
 
 ## Data flow rules
-- Generators never import writers; writers never import generators.
-- main.py is the ONLY module that wires stages, validates composition,
-  builds the generation context, and constructs output paths (layout is an
-  orchestration contract - writers stay layout-agnostic).
-- main.py imports the writer FACTORY, never a concrete writer (ADR-0017).
-- Serialization policies live in src/writers/serialization.py (ADR-0018).
+- Generators never import writers or src/quality; src/quality imports neither.
+- Corruption is LOCAL: the engine sits at the write boundary; context for
+  child entities is always built from clean records (ADR-0015/0021).
+- Quality rules get their own child seeds: {entity}:quality:{rule} (ADR-0021).
+- Absent quality config = byte-identical clean output.
+- quality runs must target a directory other than the clean baseline (guard).
 
 ## Module responsibilities
 | Module                     | Responsibility                                        |
 |----------------------------|-------------------------------------------------------|
-| main.py                    | Wiring, composition validation, context, path builder |
+| main.py                    | Wiring, validation, context, paths, engine wiring     |
 | src/core/                  | paths, config, seeds, logging (infrastructure)        |
 | src/models/                | Data contracts (frozen dataclasses, SCHEMA_VERSION)   |
-| src/generators/            | Record streams; know nothing about files              |
-| src/writers/base.py        | Writer ABC: lifecycle + ATOMIC writes (ADR-0017/0020) |
-| src/writers/serialization  | Shared text and native serialization policies         |
-| src/writers/*_writer.py    | Format implementations                                |
+| src/generators/            | Clean record streams; know nothing about corruption   |
+| src/quality/               | Impurity engine: stream transforms (ADR-0021)         |
+| src/writers/               | Serialization + atomic file lifecycle                 |
 | src/metadata/              | Run manifests (v2) and audit info                     |
 
 ## Logging
-Contract: ADR-0009. Stages: STARTUP, CONFIG, SEED, GENERATION, WRITER, MANIFEST, SUMMARY.
-Crashes logged via run() with exit codes 0/1/130.
+Contract: ADR-0009. Stages: STARTUP, CONFIG, SEED, GENERATION, QUALITY, WRITER, MANIFEST, SUMMARY.
+The QUALITY tag was added by ADR-0021.
 
 ## Planned (do not create early)
-src/quality, src/scenarios, src/streaming, src/orchestration
+5b: duplicates + invalid FK rules. 5c: schema drift + out-of-range values.

@@ -56,12 +56,24 @@ class OutputConfig:
 
 
 @dataclass(frozen=True)
+class QualityDatasetConfig:
+    null_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QualityConfig:
+    null_rate: float
+    datasets: dict[str, QualityDatasetConfig]
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     config_file: Path
     run: RunConfig
     generation: GenerationConfig
     datasets: dict[str, DatasetConfig]
     output: OutputConfig
+    quality: QualityConfig | None = None   # absent quality = clean run (ADR-0021)
 
 
 def parse_duration_to_days(value: str) -> int:
@@ -115,6 +127,7 @@ def load_config(config_file: Path) -> PipelineConfig:
         generation=_parse_generation(raw.get("generation")),
         datasets=_parse_datasets(raw.get("datasets")),
         output=_parse_output(raw.get("output")),
+        quality=_parse_quality(raw.get("quality")),
     )
     _log_resolved(config)
     return config
@@ -166,6 +179,40 @@ def _parse_output(section: object) -> OutputConfig:
     return OutputConfig(directory=resolve_path(Path(directory)), format=fmt)
 
 
+def _parse_quality(section: object) -> QualityConfig | None:
+    """Parse the optional quality section (ADR-0021). Absent = clean runs."""
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ConfigError("quality must be a mapping")
+    rate = section.get("null_rate")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) \
+            or not 0.0 <= float(rate) <= 1.0:
+        raise ConfigError("quality.null_rate must be a number within [0, 1]")
+    datasets_section = section.get("datasets")
+    if not isinstance(datasets_section, dict) or not datasets_section:
+        raise ConfigError("quality.datasets must list at least one dataset")
+    datasets: dict[str, QualityDatasetConfig] = {}
+    for name, spec in datasets_section.items():
+        raw_fields = spec.get("null_fields") if isinstance(spec, dict) else None
+        if (not isinstance(raw_fields, list) or not raw_fields
+                or not all(isinstance(f, str) and f for f in raw_fields)):
+            raise ConfigError(
+                f"quality.datasets.{name}.null_fields must be a non-empty "
+                "list of column names"
+            )
+        protected = [f for f in raw_fields if f.endswith("_id")]
+        if protected:
+            raise ConfigError(
+                f"quality.datasets.{name}.null_fields contains identifier "
+                f"field(s) {protected} - identifiers are protected in the "
+                "null rule; deliberately invalid foreign keys are a separate "
+                "impurity rule (ADR-0021)"
+            )
+        datasets[name] = QualityDatasetConfig(null_fields=tuple(raw_fields))
+    return QualityConfig(null_rate=float(rate), datasets=datasets)
+
+
 def _log_resolved(config: PipelineConfig) -> None:
     """Log every resolved value (ADR-0009: the CONFIG stage contract)."""
     logger.info("[CONFIG] seed=%s", config.run.seed)
@@ -175,3 +222,10 @@ def _log_resolved(config: PipelineConfig) -> None:
         logger.info("[CONFIG] dataset=%s records=%s", dataset.name, dataset.records)
     logger.info("[CONFIG] output.directory=%s", config.output.directory)
     logger.info("[CONFIG] output.format=%s", config.output.format)
+    if config.quality is None:
+        logger.info("[CONFIG] quality=clean (no quality section)")
+    else:
+        logger.info("[CONFIG] quality null_rate=%s", config.quality.null_rate)
+        for name, spec in config.quality.datasets.items():
+            logger.info("[CONFIG] quality dataset=%s null_fields=%s",
+                        name, list(spec.null_fields))

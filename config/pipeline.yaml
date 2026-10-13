@@ -10,23 +10,32 @@ generation:
 
 datasets:
   customer:
-    records: 10000
+    records: 1000
   supplier:
-    records: 3500               # generated BEFORE product (ADR-0014 order)
+    records: 50               # generated BEFORE product (ADR-0014 order)
   product:
-    records: 3000              # FK: supplier_id in 1..supplier.records
+    records: 300              # FK: supplier_id in 1..supplier.records
   employee:
-    records: 200               # independent; FK target of order.sales_rep_employee_id
+    records: 20               # independent; FK target of order.sales_rep_employee_id
   order:
-    records: 500000             # FK: customer_id, sales_rep_employee_id (ADR-0015/0016)
+    records: 5000             # FK: customer_id, sales_rep_employee_id (ADR-0015/0016)
   order_item:
-    records: 600000            # MUST be >= order.records (every order >= 1 item, ADR-0016)
+    records: 12000            # MUST be >= order.records (every order >= 1 item, ADR-0016)
   payment:
-    records: 30000             # sampled from COMPLETED orders only; must not
-                              # exceed their count (~70% of orders), ADR-0016
+    records: 3000             # sampled from COMPLETED orders only (ADR-0016)
   review:
-    records: 30000             # unique customer/product pairs from completed purchases
+    records: 2000             # unique customer/product pairs from completed purchases
 
 output:
   directory: data/generated   # resolved against project root (ADR-0010)
   format: csv
+
+# Impurity engine (ADR-0021) - commented out = CLEAN runs (byte-identical).
+# When active, output.directory MUST point at data/corrupted (guard in main.py).
+# quality:
+#   null_rate: 0.01           # fraction of records corrupted, 0..1
+#   datasets:
+#     customer:
+#       null_fields: [phone, city]
+#     product:
+#       null_fields: [category]
