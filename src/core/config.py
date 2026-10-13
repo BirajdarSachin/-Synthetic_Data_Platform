@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
@@ -57,13 +57,24 @@ class OutputConfig:
 
 @dataclass(frozen=True)
 class QualityDatasetConfig:
-    null_fields: tuple[str, ...]
+    """Per-dataset impurity targets (ADR-0021/0022).
+
+    null_fields:      columns the null rule may set to None (never *_id).
+    invalid_fk_fields: mapping FK field -> parent dataset name (only *_id).
+    """
+
+    null_fields: tuple[str, ...] = ()
+    invalid_fk_fields: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class QualityConfig:
+    """Impurity configuration (ADR-0021/0022). Absent section = clean runs."""
+
     null_rate: float
     datasets: dict[str, QualityDatasetConfig]
+    duplicate_rate: float = 0.0
+    invalid_fk_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -179,38 +190,77 @@ def _parse_output(section: object) -> OutputConfig:
     return OutputConfig(directory=resolve_path(Path(directory)), format=fmt)
 
 
+def _parse_rate(section: dict, key: str, default: float | None = None) -> float:
+    """Parse and validate a quality rate within [0, 1] (ADR-0021/0022)."""
+    value = section.get(key, default)
+    if value is None:
+        raise ConfigError(f"Missing required section/key: quality.{key}")
+    if (not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not 0.0 <= float(value) <= 1.0):
+        raise ConfigError(f"quality.{key} must be a number within [0, 1]")
+    return float(value)
+
+
 def _parse_quality(section: object) -> QualityConfig | None:
-    """Parse the optional quality section (ADR-0021). Absent = clean runs."""
+    """Parse the optional quality section (ADR-0021/0022). Absent = clean runs."""
     if section is None:
         return None
     if not isinstance(section, dict):
         raise ConfigError("quality must be a mapping")
-    rate = section.get("null_rate")
-    if not isinstance(rate, (int, float)) or isinstance(rate, bool) \
-            or not 0.0 <= float(rate) <= 1.0:
-        raise ConfigError("quality.null_rate must be a number within [0, 1]")
+    null_rate = _parse_rate(section, "null_rate")
+    duplicate_rate = _parse_rate(section, "duplicate_rate", default=0.0)
+    invalid_fk_rate = _parse_rate(section, "invalid_fk_rate", default=0.0)
     datasets_section = section.get("datasets")
     if not isinstance(datasets_section, dict) or not datasets_section:
         raise ConfigError("quality.datasets must list at least one dataset")
     datasets: dict[str, QualityDatasetConfig] = {}
     for name, spec in datasets_section.items():
-        raw_fields = spec.get("null_fields") if isinstance(spec, dict) else None
-        if (not isinstance(raw_fields, list) or not raw_fields
+        if not isinstance(spec, dict):
+            raise ConfigError(f"quality.datasets.{name} must be a mapping")
+        raw_fields = spec.get("null_fields", [])
+        if (not isinstance(raw_fields, list)
                 or not all(isinstance(f, str) and f for f in raw_fields)):
             raise ConfigError(
-                f"quality.datasets.{name}.null_fields must be a non-empty "
-                "list of column names"
+                f"quality.datasets.{name}.null_fields must be a list of column names"
             )
         protected = [f for f in raw_fields if f.endswith("_id")]
         if protected:
             raise ConfigError(
                 f"quality.datasets.{name}.null_fields contains identifier "
                 f"field(s) {protected} - identifiers are protected in the "
-                "null rule; deliberately invalid foreign keys are a separate "
-                "impurity rule (ADR-0021)"
+                "null rule; deliberately invalid foreign keys are the "
+                "separate invalid_fk rule (ADR-0021/0022)"
             )
-        datasets[name] = QualityDatasetConfig(null_fields=tuple(raw_fields))
-    return QualityConfig(null_rate=float(rate), datasets=datasets)
+        raw_fk = spec.get("invalid_fk_fields", {})
+        if not isinstance(raw_fk, dict):
+            raise ConfigError(
+                f"quality.datasets.{name}.invalid_fk_fields must be a mapping "
+                "of FK field -> parent dataset name"
+            )
+        non_ids = [f for f in raw_fk if not f.endswith("_id")]
+        if non_ids:
+            raise ConfigError(
+                f"quality.datasets.{name}.invalid_fk_fields must contain only "
+                f"identifier field(s) (*_id), got {non_ids} - the invalid-FK "
+                "rule corrupts foreign keys only (ADR-0022)"
+            )
+        bad_parents = [p for p in raw_fk.values()
+                       if not isinstance(p, str) or not p]
+        if bad_parents:
+            raise ConfigError(
+                f"quality.datasets.{name}.invalid_fk_fields values must be "
+                "non-empty parent dataset names"
+            )
+        datasets[name] = QualityDatasetConfig(
+            null_fields=tuple(raw_fields),
+            invalid_fk_fields=dict(raw_fk),
+        )
+    return QualityConfig(
+        null_rate=null_rate,
+        datasets=datasets,
+        duplicate_rate=duplicate_rate,
+        invalid_fk_rate=invalid_fk_rate,
+    )
 
 
 def _log_resolved(config: PipelineConfig) -> None:
@@ -225,7 +275,11 @@ def _log_resolved(config: PipelineConfig) -> None:
     if config.quality is None:
         logger.info("[CONFIG] quality=clean (no quality section)")
     else:
-        logger.info("[CONFIG] quality null_rate=%s", config.quality.null_rate)
+        logger.info(
+            "[CONFIG] quality null_rate=%s duplicate_rate=%s invalid_fk_rate=%s",
+            config.quality.null_rate, config.quality.duplicate_rate,
+            config.quality.invalid_fk_rate,
+        )
         for name, spec in config.quality.datasets.items():
-            logger.info("[CONFIG] quality dataset=%s null_fields=%s",
-                        name, list(spec.null_fields))
+            logger.info("[CONFIG] quality dataset=%s null_fields=%s invalid_fk=%s",
+                        name, list(spec.null_fields), dict(spec.invalid_fk_fields))

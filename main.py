@@ -1,6 +1,6 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021)
+Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021/0022)
           -> write (format from config, ADR-0017) -> manifest.
 Generation order follows FK dependencies (ADR-0014); context (ADR-0015) is
 always extracted from CLEAN records - corruption is local to written files.
@@ -95,7 +95,8 @@ def _validate_composition(config) -> None:
 
 
 def _validate_quality_output(config) -> None:
-    """ADR-0021 guard: quality runs must target a separate output directory."""
+    """ADR-0021/0022 guards for quality runs (structural checks live in
+    config.py; these are cross-section checks)."""
     if config.quality is None:
         return
     unknown = set(config.quality.datasets) - KNOWN_DATASETS
@@ -109,6 +110,15 @@ def _validate_quality_output(config) -> None:
             "(data/generated). Set output.directory: data/corrupted so "
             "corrupted runs never overwrite clean datasets (ADR-0021)"
         )
+    for name, spec in config.quality.datasets.items():
+        for field_name, parent in spec.invalid_fk_fields.items():
+            if parent not in config.datasets:
+                raise ConfigError(
+                    f"quality.datasets.{name}.invalid_fk_fields"
+                    f"[{field_name!r}] references parent {parent!r} which is "
+                    "not in datasets - the parent record count is required "
+                    "to compute out-of-range ids (ADR-0022)"
+                )
 
 
 def _run_entity(config, writer, engine, generator, schema_version: str,
@@ -117,6 +127,8 @@ def _run_entity(config, writer, engine, generator, schema_version: str,
 
     Returns the CLEAN records so facts/context extraction (ADR-0015) never
     sees corrupted values - corruption is local to written files (ADR-0021).
+    Note: with the duplicate rule, the written count can exceed the
+    generated count - the manifest records the WRITTEN count.
     """
     cfg = config.datasets[generator.ENTITY]
     file_path = _entity_file_path(config, generator.ENTITY)
@@ -142,7 +154,9 @@ def main() -> None:
     config = load_config(resolve_path(Path("config/pipeline.yaml")))
     seeds = SeedManager(config.run.seed)
     writer = get_writer(config.output.format)
-    engine = ImpurityEngine(seeds, config.quality) if config.quality else None
+    dataset_counts = {name: cfg.records for name, cfg in config.datasets.items()}
+    engine = (ImpurityEngine(seeds, config.quality, dataset_counts)
+              if config.quality else None)
     logger.info("[WRITER] output_dir=%s format=%s writer=%s",
                 config.output.directory, config.output.format, type(writer).__name__)
     _validate_composition(config)
@@ -263,8 +277,13 @@ def main() -> None:
     if config.quality is not None:
         manifest["quality"] = {
             "null_rate": config.quality.null_rate,
+            "duplicate_rate": config.quality.duplicate_rate,
+            "invalid_fk_rate": config.quality.invalid_fk_rate,
             "datasets": {
-                name: list(spec.null_fields)
+                name: {
+                    "null_fields": list(spec.null_fields),
+                    "invalid_fk_fields": dict(spec.invalid_fk_fields),
+                }
                 for name, spec in config.quality.datasets.items()
             },
         }
@@ -279,7 +298,8 @@ def main() -> None:
 
 
 def _fake_config_for_guard_test(quality, directory: Path):
-    """Test hook: build a minimal config for the guard test only."""
+    """Test hook: build a minimal config for guard tests only."""
+    from datetime import date
     from src.core.config import (
         DatasetConfig,
         GenerationConfig,
@@ -290,7 +310,7 @@ def _fake_config_for_guard_test(quality, directory: Path):
     return PipelineConfig(
         config_file=Path("pipeline.yaml"),
         run=RunConfig(seed=1),
-        generation=GenerationConfig(reference_date=Path("x") and __import__("datetime").date(2026, 1, 15), history_days=365),
+        generation=GenerationConfig(reference_date=date(2026, 1, 15), history_days=365),
         datasets={"customer": DatasetConfig(name="customer", records=1)},
         output=OutputConfig(directory=directory, format="csv"),
         quality=quality,

@@ -30,12 +30,18 @@ output:
   directory: data/generated   # resolved against project root (ADR-0010)
   format: csv
 
-# Impurity engine (ADR-0021) - commented out = CLEAN runs (byte-identical).
+# Impurity engine (ADR-0021/0022) - commented out = CLEAN runs (byte-identical).
 # When active, output.directory MUST point at data/corrupted (guard in main.py).
+# Rule chain order is fixed: null -> invalid_fk -> duplicate (ADR-0022).
 # quality:
-#   null_rate: 0.01           # fraction of records corrupted, 0..1
+#   null_rate: 0.01           # fraction of records getting one field nulled
+#   duplicate_rate: 0.02      # fraction of records re-emitted as exact copies
+#   invalid_fk_rate: 0.005    # fraction of records with an out-of-range FK
 #   datasets:
 #     customer:
 #       null_fields: [phone, city]
-#     product:
-#       null_fields: [category]
+#     order:
+#       null_fields: [status]
+#       invalid_fk_fields:    # FK field -> parent dataset (explicit mapping)
+#         customer_id: customer
+#         sales_rep_employee_id: employee

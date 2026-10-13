@@ -25,9 +25,10 @@
 
 ## PHASE 4 - Impurity engine
 - [x] Engine skeleton: stream transform, quality config, guard, seeds (ADR-0021) (Milestone 5a)
-- [x] NULL injection rule + format behavior (CSV empty cell, JSON null, Parquet typed null) (Milestone 5a)
-- [ ] Duplicate record rule (Milestone 5b)
-- [ ] Invalid FK reference rule (Milestone 5b)
+- [x] NULL injection rule + format behavior (Milestone 5a)
+- [x] Duplicate record rule: delayed exact-copy re-emission (ADR-0022) (Milestone 5b)
+- [x] Invalid FK rule: out-of-range ids, explicit parent mapping (ADR-0022) (Milestone 5b)
+- [x] Fixed rule chain: null -> invalid_fk -> duplicate (ADR-0022) (Milestone 5b)
 - [ ] Schema drift (missing/extra columns) (Milestone 5c)
 - [ ] Out-of-range / invalid values (Milestone 5c)
 
