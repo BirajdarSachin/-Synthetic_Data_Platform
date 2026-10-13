@@ -12,15 +12,17 @@
 
 ## PHASE 2 - Relational domain
 - [x] Supplier + product with FK (Milestone 3a)
-- [x] Employee generator (Milestone 3b)
-- [x] Order generator (FK customer + employee, temporal rule) (Milestone 3b)
-- [x] Order item generator (FK order + product, >= 1 per order) (Milestone 3b)
-- [x] Payment generator (completed orders, amount = order total) (Milestone 3b)
-- [x] Review generator (completed purchases, unique customer/product pairs, post-purchase dates)
-- [x] main.py composition validation + context wiring (ADR-0015) (Milestone 3b)
-- [x] Business rules by construction + tests (ADR-0016), including review purchase eligibility
+- [x] Employee, order, order_item, payment with business rules (Milestone 3b)
+- [x] Review entity - user-built, reviewed (Milestone 3c)
+- [x] 500k-order stress run (intentional; informs Phase 7)
 
-## PHASE 3 - Formats & layout (writer interface, JSON, Parquet, Hive partitions, atomic writes)
+## PHASE 3 - Formats & layout
+- [x] Writer interface (ABC) + factory (ADR-0017) (Milestone 4a)
+- [x] JSON / NDJSON writer (Milestone 4a)
+- [ ] Parquet writer (pandas + pyarrow, writers only) (Milestone 4b - user-driven)
+- [ ] Hive-style partitioned output (Milestone 4b)
+- [ ] Atomic writes inside the Writer lifecycle (Milestone 4b)
+
 ## PHASE 4 - Impurity engine (nulls, duplicates, invalid FKs, schema drift - breaks ADR-0016 rules on purpose)
 ## PHASE 5 - Temporal & incremental (window engine, granularity, INSERT/UPDATE/DELETE, CDC-style)
 ## PHASE 6 - Event streams (event_time vs ingestion_time, late/duplicate/out-of-order)

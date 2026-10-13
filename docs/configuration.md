@@ -12,7 +12,7 @@ Relative paths resolve against the project root (ADR-0010).
 | generation.history        | str  | no (default "3y") | Duration: '30d', '4m', '2y', '10y', '1y6m' (ADR-0012) |
 | datasets.<name>.records   | int  | yes               | >= 1                                                  |
 | output.directory          | str  | yes               | Relative to project root                              |
-| output.format             | str  | yes               | Currently only: csv                                   |
+| output.format             | str  | yes               | csv \| json (ADR-0017); file extension follows format |
 
 ## History (ADR-0012)
 Window for historical dates: [reference_date - history_days, reference_date].
@@ -23,15 +23,14 @@ Forms: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'; fixed units (y=365d, m=30d).
 - order requires customer and employee
 - order_item requires order and product; order_item.records >= order.records
 - payment requires order and order_item; payment.records must not exceed the
-  number of completed orders (~70% of order.records with the default split) -
-  otherwise a ValueError stops the run loudly.
-- review requires order and order_item; reviews are limited to unique
-  customer/product pairs in completed purchases with a review date after
-  the latest purchase date.
+  number of completed orders (~70% of order.records with the default split).
+- review requires order and order_item; limited to unique customer/product
+  pairs in completed purchases, review date after the latest purchase.
 
 ## Error behavior
-Invalid config raises ConfigError before any file is written; rule violations
-during generation raise ValueError and are logged by run() with exit code 1.
+Invalid config raises ConfigError before any file is written; unsupported
+output.format is rejected by config validation; rule violations during
+generation raise ValueError and are logged by run() with exit code 1.
 
 ## Known datasets
 customer, supplier, product, employee, order, order_item, payment, review.

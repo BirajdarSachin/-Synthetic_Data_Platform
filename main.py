@@ -1,5 +1,7 @@
 """Entry point - wires the stages together. No business logic lives here.
 
+Pipeline: config -> seed -> generate -> write (format from config, ADR-0017)
+          -> manifest.
 Generation order follows FK dependencies (ADR-0014):
   customer, supplier, employee (independent)
     -> product (needs supplier count)
@@ -7,6 +9,7 @@ Generation order follows FK dependencies (ADR-0014):
     -> order_item (needs order count + product prices)
     -> review (completed orders + purchased order items)
     -> payment (needs completed orders + item totals)
+main.py selects the Writer via the factory and never imports concrete writers.
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
 """
@@ -42,7 +45,7 @@ from src.models.payment import SCHEMA_VERSION as PAYMENT_SCHEMA_VERSION
 from src.models.product import SCHEMA_VERSION as PRODUCT_SCHEMA_VERSION
 from src.models.review import SCHEMA_VERSION as REVIEW_SCHEMA_VERSION
 from src.models.supplier import SCHEMA_VERSION as SUPPLIER_SCHEMA_VERSION
-from src.writers.csv_writer import write_csv
+from src.writers import get_writer
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +93,13 @@ def _validate_composition(config) -> None:
         )
 
 
-def _run_entity(config, generator, schema_version: str, child_seed: int) -> tuple[list, dict]:
+def _run_entity(config, writer, generator, schema_version: str,
+                child_seed: int) -> tuple[list, dict]:
     """Generate, write and build manifest info for one entity. Returns (records, info)."""
     cfg = config.datasets[generator.ENTITY]
     file_path = _entity_file_path(config, generator.ENTITY)
     records = list(generator.generate(cfg.records))
-    count = write_csv(file_path, records)
+    count = writer.write(file_path, records)
     info = build_dataset_info(
         entity=generator.ENTITY,
         schema_version=schema_version,
@@ -113,7 +117,9 @@ def main() -> None:
 
     config = load_config(resolve_path(Path("config/pipeline.yaml")))
     seeds = SeedManager(config.run.seed)
-    logger.info("[WRITER] output_dir=%s", config.output.directory)
+    writer = get_writer(config.output.format)
+    logger.info("[WRITER] output_dir=%s format=%s writer=%s",
+                config.output.directory, config.output.format, type(writer).__name__)
     _validate_composition(config)
 
     datasets: dict[str, dict] = {}
@@ -126,14 +132,15 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        customers, info = _run_entity(config, gen, CUSTOMER_SCHEMA_VERSION, seed)
+        customers, info = _run_entity(
+            config, writer, gen, CUSTOMER_SCHEMA_VERSION, seed)
         datasets["customer"] = info
         facts["customers"] = [(c.customer_id, c.registration_date) for c in customers]
 
     if "supplier" in config.datasets:
         seed = seeds.child_seed(SupplierGenerator.ENTITY)
         gen = SupplierGenerator(seed=seed)
-        _, info = _run_entity(config, gen, SUPPLIER_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, gen, SUPPLIER_SCHEMA_VERSION, seed)
         datasets["supplier"] = info
 
     if "product" in config.datasets:
@@ -142,7 +149,8 @@ def main() -> None:
             seed=seed,
             supplier_count=config.datasets["supplier"].records,
         )
-        products, info = _run_entity(config, gen, PRODUCT_SCHEMA_VERSION, seed)
+        products, info = _run_entity(
+            config, writer, gen, PRODUCT_SCHEMA_VERSION, seed)
         datasets["product"] = info
         facts["products"] = [(p.product_id, p.unit_price) for p in products]
 
@@ -153,7 +161,7 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        _, info = _run_entity(config, gen, EMPLOYEE_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, gen, EMPLOYEE_SCHEMA_VERSION, seed)
         datasets["employee"] = info
 
     if "order" in config.datasets:
@@ -164,7 +172,7 @@ def main() -> None:
             customers=facts["customers"],
             employee_count=config.datasets["employee"].records,
         )
-        orders, info = _run_entity(config, gen, ORDER_SCHEMA_VERSION, seed)
+        orders, info = _run_entity(config, writer, gen, ORDER_SCHEMA_VERSION, seed)
         datasets["order"] = info
         facts["completed_orders"] = [
             (o.order_id, o.order_date) for o in orders if o.status == "completed"
@@ -177,7 +185,8 @@ def main() -> None:
             order_count=config.datasets["order"].records,
             products=facts["products"],
         )
-        items, info = _run_entity(config, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
+        items, info = _run_entity(
+            config, writer, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
         datasets["order_item"] = info
         totals: dict[int, Decimal] = {}
         for item in items:
@@ -192,13 +201,13 @@ def main() -> None:
                 for order in orders
                 if order.status == "completed"
             }
-            purchases = []
-            for item in items:
-                purchase = completed_customer_by_order.get(item.order_id)
-                if purchase is not None:
-                    customer_id, purchase_date = purchase
-                    purchases.append((customer_id, item.product_id, purchase_date))
-            facts["purchases"] = purchases
+            facts["purchases"] = [
+                (completed_customer_by_order[item.order_id][0],
+                 item.product_id,
+                 completed_customer_by_order[item.order_id][1])
+                for item in items
+                if item.order_id in completed_customer_by_order
+            ]
 
     if "review" in config.datasets:
         seed = seeds.child_seed(ReviewGenerator.ENTITY)
@@ -207,7 +216,7 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             purchases=facts["purchases"],
         )
-        _, info = _run_entity(config, gen, REVIEW_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, gen, REVIEW_SCHEMA_VERSION, seed)
         datasets["review"] = info
 
     if "payment" in config.datasets:
@@ -218,7 +227,7 @@ def main() -> None:
             completed_orders=facts["completed_orders"],
             totals=facts["totals"],
         )
-        _, info = _run_entity(config, gen, PAYMENT_SCHEMA_VERSION, seed)
+        _, info = _run_entity(config, writer, gen, PAYMENT_SCHEMA_VERSION, seed)
         datasets["payment"] = info
 
     manifest = build_run_header(

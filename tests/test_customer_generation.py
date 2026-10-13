@@ -1,5 +1,6 @@
 """Milestone 2 tests: determinism, schema contract, CSV reproducibility."""
 
+from email import generator
 import hashlib
 from dataclasses import asdict
 from datetime import date, timedelta
@@ -7,7 +8,7 @@ from pathlib import Path
 
 from src.generators.customer import CustomerGenerator
 from src.models.customer import Customer
-from src.writers.csv_writer import write_csv
+from src.writers import get_writer
 
 # Fixed reference date - never the real clock (ADR-0003).
 REFERENCE_DATE = date(2026, 1, 15)
@@ -64,6 +65,6 @@ def test_csv_output_is_byte_identical_for_same_seed(tmp_path: Path):
             seed=12345, reference_date=REFERENCE_DATE, history_days=1095
         )
         path = tmp_path / "customer.csv"
-        write_csv(path, generator.generate(100))
+        get_writer("csv").write(path, generator.generate(100))
         digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
     assert digests[0] == digests[1]

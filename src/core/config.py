@@ -18,7 +18,7 @@ from src.core.paths import resolve_path
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_FORMATS = ("csv",)  # json/parquet arrive in Phase 3
+SUPPORTED_FORMATS = ("csv", "json")  # parquet arrives later in Phase 3
 
 # ADR-0012: default history span preserves pre-0.3.0 behavior (3 * 365 days).
 DEFAULT_HISTORY = "3y"

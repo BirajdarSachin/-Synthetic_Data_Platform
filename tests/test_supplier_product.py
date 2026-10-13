@@ -11,7 +11,7 @@ import pytest
 from src.generators.product import ProductGenerator
 from src.generators.supplier import SupplierGenerator
 from src.models.product import Product
-from src.writers.csv_writer import write_csv
+from src.writers import get_writer
 
 SUPPLIER_COUNT = 50
 PRODUCT_COUNT = 300
@@ -79,6 +79,6 @@ def test_product_csv_byte_identical_same_seed(tmp_path: Path):
     for _ in range(2):
         gen = ProductGenerator(seed=12345, supplier_count=SUPPLIER_COUNT)
         path = tmp_path / "product.csv"
-        write_csv(path, gen.generate(PRODUCT_COUNT))
+        get_writer("csv").write(path, gen.generate(PRODUCT_COUNT))
         digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
     assert digests[0] == digests[1]

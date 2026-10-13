@@ -13,7 +13,7 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Decision: decimal.Decimal in models; writers serialize with exactly 2 decimal places.
 - Why: Floats corrupt money; warehouses expect DECIMAL semantics.
 - Alternatives: Integer cents; float (rejected).
-- Impact: product.unit_price, order_item.unit_price, payment.amount.
+- Impact: product.unit_price, order_item.unit_price, payment.amount; serialization.py.
 
 ## ADR-0003 - Time conventions
 - Decision: UTC ISO-8601 timestamps; plain dates; "now" injected from config, never the real clock.
@@ -79,7 +79,7 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Decision: Re-running overwrites dataset files; writer logs "[WRITER] overwriting existing file=...". Old manifests remain historical records.
 - Why: Matches lakehouse partition-overwrite behavior; keeps run -> tweak -> run fast.
 - Alternatives: Refuse overwrite (tedious); run_id in filenames (breaks ADR-0004).
-- Impact: csv_writer. Atomic writes planned Phase 3.
+- Impact: Writer base class. Atomic writes planned later in Phase 3.
 
 ## ADR-0014 - Generation order and FK-by-parent-id-range
 - Decision: Parents generated before children; child generators receive parent counts and pick FKs from 1..parent_count with their own seeded rng; composition rules validated in main.py.
@@ -88,13 +88,19 @@ ADRs are immutable. To change a decision, write a new ADR that supersedes it.
 - Impact: All child generators; main.py ordering.
 
 ## ADR-0015 - Generation context (parent attributes)
-- Decision: When a business rule needs parent ATTRIBUTES (not just ids), main.py extracts explicit tuples/dicts from generated parent records (e.g. customer (id, registration_date), product (id, unit_price), per-order totals) and passes them to the child generator constructor. Generators never import each other.
-- Why: Rules like order_date >= registration_date and item price = product price are impossible from id ranges alone; explicit wiring keeps generators decoupled and testable.
-- Alternatives: Generators reading other generators (coupling); a global registry object (premature); post-hoc data repair (violates correct-by-construction).
-- Impact: main.py holds parent lists in memory (fine at thousands of rows; Phase 7 will stream/aggregate at scale). All future attribute-dependent generators follow this pattern.
+- Decision: When a rule needs parent ATTRIBUTES (not just ids), main.py extracts explicit tuples/dicts from generated parent records and passes them to the child generator constructor. Generators never import each other.
+- Why: Rules like order_date >= registration_date are impossible from id ranges alone; explicit wiring keeps generators decoupled and testable.
+- Alternatives: Generators reading other generators (coupling); global registry object (premature); post-hoc repair (violates correct-by-construction).
+- Impact: main.py holds parent lists in memory (fine at thousands of rows; Phase 7 will stream). Context consumers: order (customer dates), order_item (product prices), payment (completed orders + totals), review (purchases with dates).
 
 ## ADR-0016 - Business rules at generation time
-- Decision: Rules are encoded in generators, not checked afterwards: order_date >= customer registration_date; every order >= 1 item (first N items map to orders 1..N); item unit_price = product unit_price; quantity 1..5; payment only for completed orders, sampled without replacement (<= 1 per order); payment_date >= order_date; payment.amount = order item total. Cross-dataset count rules enforced in main.py (order_item.records >= order.records); impossible requests raise ValueError loudly.
-- Why: Data that is valid by construction is the platform's core value; downstream projects then practice VALIDATING these rules rather than fighting noise.
-- Alternatives: Separate validation layer that repairs data (deferred to Phase 4 impurity engine, which will deliberately BREAK these rules under controlled config).
-- Impact: generators/order*, payment; tests assert each rule; Phase 4 impurity engine will target exactly these invariants.
+- Decision: Rules are encoded in generators, not checked afterwards: order_date >= customer registration_date; every order >= 1 item; item unit_price = product unit_price; quantity 1..5; payment only for completed orders, <= 1 per order, payment_date >= order_date, amount = item total; reviews reference completed purchases, <= 1 per customer/product pair, anchored to the latest purchase, review_date strictly after it and <= reference_date; same-day (reference_date) purchases are ineligible. Impossible requests raise ValueError loudly.
+- Why: Data valid by construction is the platform's core value; downstream projects practice VALIDATING these rules.
+- Alternatives: Separate repair layer (deferred to Phase 4 impurity engine, which breaks these rules under controlled config).
+- Impact: order/order_item/payment/review generators; tests assert each rule.
+
+## ADR-0017 - Writer interface, NDJSON format, shared serialization
+- Decision: src/writers/base.py defines Writer (ABC). write() is a template method owning the file lifecycle (empty-stream rejection, overwrite log, locked-file message, count/bytes log); subclasses implement only _write_records and may override _open_file. A factory get_writer(format) in writers/__init__ maps format strings to implementations; main.py never imports concrete writers. JSON output is NDJSON: one JSON object per line, UTF-8, ensure_ascii=False. Serialization rules (dates -> ISO-8601, Decimal -> 2dp strings) live in one module (serialization.py) used by every writer.
+- Why: The second format (JSON) made the promised abstraction earn its place (deferred since Milestone 2). The template method removes four duplicated concerns before they drift. NDJSON streams line by line - flat memory, line-readable by Spark/pandas/stream consumers, truncation-tolerant - unlike a single JSON array which forces whole-file parsing. One serialization module keeps ADR-0002/0003 rules identical across formats.
+- Alternatives: Single JSON array (rejected: no streaming); pandas.to_json (rejected: pandas stays out of core, ADR-0005); per-writer serialization (rejected: drift risk); typing.Protocol instead of ABC (equally valid; ABC chosen for a clear contract and shared hooks).
+- Impact: config accepts output.format: csv|json; file extension follows format via ADR-0004; future writers (parquet, avro, db) implement Writer; atomic writes will land inside the shared lifecycle and benefit every format at once.
