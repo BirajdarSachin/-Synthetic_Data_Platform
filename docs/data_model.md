@@ -4,7 +4,7 @@ Entity schemas are the platform data contracts (ADR-0007). Any change must
 follow the SCHEMA_VERSION rules in ADR-0007.
 
 Generation order follows FK dependencies (ADR-0014):
-customer, supplier, employee -> product, order -> order_item -> payment.
+customer, supplier, employee -> product, order -> order_item -> review, payment.
 
 ## customer - schema v1.0
 PK customer_id (sequential from 1). Columns: first_name, last_name, email
@@ -45,8 +45,22 @@ Business rules: at most one payment per order; completed orders only;
 payment_date >= order_date; amount = sum(quantity * unit_price) of the
 order's items.
 
+## review - schema v1.0
+PK review_id. FKs: customer_id -> customer, product_id -> product. Columns:
+rating (1..5), review_date, review_text.
+Business rules: reviews are only for products purchased by that customer in a
+completed order; at most one review per customer/product pair. If the pair
+has multiple purchases, the latest purchase is the anchor: a review must follow
+the customer's most recent experience with that product, rather than an
+earlier purchase. review_date is strictly after the anchor date (purchase date
++ 1 day minimum) and no later than the reference date. A pair whose latest
+purchase is on the reference date is ineligible because no valid review date
+can be both after that purchase and on or before the reference date. Therefore,
+a prior purchase does not make a pair eligible if it was repurchased on the
+reference date.
+
 ## Relationship map
-supplier -> product -> order_item <- order -> payment
+supplier -> product -> order_item <- order -> payment, review
 customer -> order <- employee (sales rep)
 
 Note: all records land in one file per entity today; per-window partitioned
