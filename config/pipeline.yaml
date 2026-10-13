@@ -30,13 +30,15 @@ output:
   directory: data/generated   # resolved against project root (ADR-0010)
   format: csv
 
-# Impurity engine (ADR-0021/0022) - commented out = CLEAN runs (byte-identical).
+# Impurity engine (ADR-0021/0022/0023) - commented out = CLEAN runs.
 # When active, output.directory MUST point at data/corrupted (guard in main.py).
-# Rule chain order is fixed: null -> invalid_fk -> duplicate (ADR-0022).
+# Fixed chain: null -> invalid_fk -> out_of_range -> drift -> duplicate.
 # quality:
-#   null_rate: 0.01           # fraction of records getting one field nulled
-#   duplicate_rate: 0.02      # fraction of records re-emitted as exact copies
-#   invalid_fk_rate: 0.005    # fraction of records with an out-of-range FK
+#   null_rate: 0.01           # one field nulled on a fraction of records
+#   duplicate_rate: 0.02      # records re-emitted as exact delayed copies
+#   invalid_fk_rate: 0.005    # records with an out-of-range FK
+#   out_of_range_rate: 0.005  # numeric fields negated
+#   drift_rate: 0.0           # records with dropped/extra columns
 #   datasets:
 #     customer:
 #       null_fields: [phone, city]
@@ -45,3 +47,8 @@ output:
 #       invalid_fk_fields:    # FK field -> parent dataset (explicit mapping)
 #         customer_id: customer
 #         sales_rep_employee_id: employee
+#     order_item:
+#       out_of_range_fields: [quantity]
+#     product:
+#       drop_fields: [category]     # schema drift: missing column
+#       extra_fields: [legacy_sku]  # schema drift: unexpected column

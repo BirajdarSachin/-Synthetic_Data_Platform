@@ -1,12 +1,13 @@
 """Impurity engine - applies the configured rule chain to record streams.
 
-Fixed chain per entity (ADR-0022):
-  1. null injection   (one configured non-id field -> None)
-  2. invalid FK       (one *_id field -> out-of-range id)
-  3. duplication      (exact copy re-emitted after a delay)
-Order matters: duplication runs LAST so duplicates are exact copies of the
-already-corrupted record. Each rule has its own child seed
-"{entity}:quality:{rule}" (ADR-0021) - independent, reproducible streams.
+Fixed chain per entity (ADR-0022/0023):
+  1. null injection     (one configured non-id field -> None)
+  2. invalid FK         (one *_id field -> out-of-range id)
+  3. out-of-range value (one numeric field -> negated)
+  4. schema drift       (record shape changes: drop/extra fields)
+  5. duplication        (exact copy re-emitted after a delay) - LAST, so
+    duplicates are exact copies of fully-corrupted records.
+Each rule has its own child seed "{entity}:quality:{rule}" (ADR-0021).
 """
 
 import logging
@@ -17,6 +18,8 @@ from src.core.seed_manager import SeedManager
 from src.quality.duplicate_rule import DuplicateRule
 from src.quality.invalid_fk_rule import InvalidForeignKeyRule
 from src.quality.null_rule import NullInjectionRule
+from src.quality.out_of_range_rule import OutOfRangeRule
+from src.quality.schema_drift_rule import SchemaDriftRule
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,24 @@ class ImpurityEngine:
                     f"{entity}:quality:invalid_fk"),
                 fk_specs=self._parent_counts(entity, spec.invalid_fk_fields),
                 rate=self._quality.invalid_fk_rate,
+            ).apply(stream)
+        if spec.out_of_range_fields and self._quality.out_of_range_rate > 0.0:
+            stream = OutOfRangeRule(
+                entity=entity,
+                seed=self._seed_manager.child_seed(
+                    f"{entity}:quality:out_of_range"),
+                target_fields=spec.out_of_range_fields,
+                rate=self._quality.out_of_range_rate,
+            ).apply(stream)
+        if ((spec.drop_fields or spec.extra_fields)
+                and self._quality.drift_rate > 0.0):
+            stream = SchemaDriftRule(
+                entity=entity,
+                seed=self._seed_manager.child_seed(
+                    f"{entity}:quality:drift"),
+                drop_fields=spec.drop_fields,
+                extra_fields=spec.extra_fields,
+                rate=self._quality.drift_rate,
             ).apply(stream)
         if self._quality.duplicate_rate > 0.0:
             stream = DuplicateRule(

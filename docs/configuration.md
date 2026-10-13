@@ -14,30 +14,33 @@ Relative paths resolve against the project root (ADR-0010).
 | output.directory          | str  | yes               | Relative to project root                              |
 | output.format             | str  | yes               | csv \| json \| parquet (ADR-0017); extension follows format |
 | quality                   | map  | no                | Absent = clean runs (ADR-0021)                        |
-| quality.null_rate         | num  | with quality      | 0..1; fraction of records getting one field nulled    |
-| quality.duplicate_rate    | num  | no (default 0.0)  | 0..1; fraction of records re-emitted as exact copies  |
-| quality.invalid_fk_rate   | num  | no (default 0.0)  | 0..1; fraction of records with an out-of-range FK     |
-| quality.datasets.<n>.null_fields       | list | no | Non-id columns; identifier fields (*_id) rejected   |
-| quality.datasets.<n>.invalid_fk_fields | map  | no | FK field -> parent dataset name; only *_id fields   |
+| quality.null_rate         | num  | with quality      | 0..1; one field nulled on a fraction of records       |
+| quality.duplicate_rate    | num  | no (default 0.0)  | 0..1; records re-emitted as exact delayed copies      |
+| quality.invalid_fk_rate   | num  | no (default 0.0)  | 0..1; records with an out-of-range FK                 |
+| quality.out_of_range_rate | num  | no (default 0.0)  | 0..1; numeric fields negated (ADR-0023)               |
+| quality.drift_rate        | num  | no (default 0.0)  | 0..1; records with dropped/extra columns (ADR-0023)   |
+| quality.datasets.<n>.null_fields       | list | no | Non-id columns; identifiers rejected               |
+| quality.datasets.<n>.invalid_fk_fields | map  | no | FK field -> parent dataset; only *_id fields       |
+| quality.datasets.<n>.out_of_range_fields | list | no | Numeric non-id columns; overlap with null_fields rejected |
+| quality.datasets.<n>.drop_fields         | list | no | Non-id columns removed from drifted records        |
+| quality.datasets.<n>.extra_fields        | list | no | Marker columns added to drifted records            |
 
 ## Output layout (ADR-0019)
 {output.directory}/{entity}/reference_date={YYYY-MM-DD}/{entity}_{date}.{format}.
 Manifests: {output.directory}/_manifests/run_<run_id>.json (manifest_version 2;
 a quality run records its full quality config in the manifest).
 
-## Quality / impurity (ADR-0021/0022)
-- Fixed rule chain per entity: null -> invalid_fk -> duplicate. Duplication
-  runs last, so duplicates are exact copies of already-corrupted records.
+## Quality / impurity (ADR-0021/0022/0023)
+- Fixed chain: null -> invalid_fk -> out_of_range -> drift -> duplicate (last).
 - Each rule has its own child seed: {entity}:quality:{rule}.
-- Null rule: one configured field per selected record; identifier fields
-  (*_id) rejected. Invalid-FK rule: only *_id fields; the invalid value is
-  out-of-range (> parent record count) because parent PKs are sequential
-  1..N (ADR-0001); the field -> parent mapping is explicit in config.
-- Duplicate rule: selected records re-emitted after a delay of 1..max_delay
-  originals (bounded buffer, O(max_delay) memory).
+- Protection symmetry: null/out_of_range/drop reject *_id fields; invalid_fk
+  requires *_id fields.
+- Out-of-range strategy: value -> -abs(value); numeric fields only.
+- Drift: dropped column and/or extra marker column "__unexpected__" on
+  drifted records. Format behavior: CSV dropped->empty cell / extra->loud
+  error; JSON natural; Parquet drift is VISIBLE IN THE FILE SCHEMA.
 - Corruption is local: child-entity context is always built from clean records.
 - GUARD: quality active + output.directory = data/generated raises ConfigError.
-  Corrupted runs belong in data/corrupted.
 
 ## Dataset composition rules (ADR-0014/0016)
 - product requires supplier; order requires customer and employee.

@@ -1,6 +1,6 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021/0022)
+Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021..0023)
           -> write (format from config, ADR-0017) -> manifest.
 Generation order follows FK dependencies (ADR-0014); context (ADR-0015) is
 always extracted from CLEAN records - corruption is local to written files.
@@ -50,7 +50,6 @@ KNOWN_DATASETS = {
     "payment", "review",
 }
 
-# ADR-0014/0016: a child entity requires its parents in the same config.
 COMPOSITION_RULES = {
     "product": ["supplier"],
     "order": ["customer", "employee"],
@@ -59,7 +58,6 @@ COMPOSITION_RULES = {
     "review": ["order", "order_item"],
 }
 
-# ADR-0021: corrupted runs must never overwrite the clean baseline.
 _CLEAN_BASELINE = resolve_path(Path("data/generated"))
 
 
@@ -95,8 +93,7 @@ def _validate_composition(config) -> None:
 
 
 def _validate_quality_output(config) -> None:
-    """ADR-0021/0022 guards for quality runs (structural checks live in
-    config.py; these are cross-section checks)."""
+    """Quality-run guards (structural checks live in config.py)."""
     if config.quality is None:
         return
     unknown = set(config.quality.datasets) - KNOWN_DATASETS
@@ -127,8 +124,8 @@ def _run_entity(config, writer, engine, generator, schema_version: str,
 
     Returns the CLEAN records so facts/context extraction (ADR-0015) never
     sees corrupted values - corruption is local to written files (ADR-0021).
-    Note: with the duplicate rule, the written count can exceed the
-    generated count - the manifest records the WRITTEN count.
+    With the duplicate rule, the written count can exceed the generated
+    count - the manifest records the WRITTEN count.
     """
     cfg = config.datasets[generator.ENTITY]
     file_path = _entity_file_path(config, generator.ENTITY)
@@ -279,10 +276,15 @@ def main() -> None:
             "null_rate": config.quality.null_rate,
             "duplicate_rate": config.quality.duplicate_rate,
             "invalid_fk_rate": config.quality.invalid_fk_rate,
+            "out_of_range_rate": config.quality.out_of_range_rate,
+            "drift_rate": config.quality.drift_rate,
             "datasets": {
                 name: {
                     "null_fields": list(spec.null_fields),
                     "invalid_fk_fields": dict(spec.invalid_fk_fields),
+                    "out_of_range_fields": list(spec.out_of_range_fields),
+                    "drop_fields": list(spec.drop_fields),
+                    "extra_fields": list(spec.extra_fields),
                 }
                 for name, spec in config.quality.datasets.items()
             },
