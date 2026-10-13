@@ -25,10 +25,13 @@ Forms: '10y', '2y', '4m', '30d', '1y6m', '2y3m10d'; fixed units (y=365d, m=30d).
 - payment requires order and order_item; payment.records must not exceed the
   number of completed orders (~70% of order.records with the default split) -
   otherwise a ValueError stops the run loudly.
+- review requires order and order_item; reviews are limited to unique
+  customer/product pairs in completed purchases with a review date after
+  the latest purchase date.
 
 ## Error behavior
 Invalid config raises ConfigError before any file is written; rule violations
 during generation raise ValueError and are logged by run() with exit code 1.
 
 ## Known datasets
-customer, supplier, product, employee, order, order_item, payment.
+customer, supplier, product, employee, order, order_item, payment, review.

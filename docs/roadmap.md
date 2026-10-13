@@ -16,8 +16,9 @@
 - [x] Order generator (FK customer + employee, temporal rule) (Milestone 3b)
 - [x] Order item generator (FK order + product, >= 1 per order) (Milestone 3b)
 - [x] Payment generator (completed orders, amount = order total) (Milestone 3b)
+- [x] Review generator (completed purchases, unique customer/product pairs, post-purchase dates)
 - [x] main.py composition validation + context wiring (ADR-0015) (Milestone 3b)
-- [x] Business rules by construction + tests (ADR-0016) (Milestone 3b)
+- [x] Business rules by construction + tests (ADR-0016), including review purchase eligibility
 
 ## PHASE 3 - Formats & layout (writer interface, JSON, Parquet, Hive partitions, atomic writes)
 ## PHASE 4 - Impurity engine (nulls, duplicates, invalid FKs, schema drift - breaks ADR-0016 rules on purpose)

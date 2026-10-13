@@ -5,6 +5,7 @@ Generation order follows FK dependencies (ADR-0014):
     -> product (needs supplier count)
     -> order (needs customer DATES + employee count, ADR-0015 context)
     -> order_item (needs order count + product prices)
+    -> review (completed orders + purchased order items)
     -> payment (needs completed orders + item totals)
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
@@ -26,6 +27,7 @@ from src.generators.order import OrderGenerator
 from src.generators.order_item import OrderItemGenerator
 from src.generators.payment import PaymentGenerator
 from src.generators.product import ProductGenerator
+from src.generators.review import ReviewGenerator
 from src.generators.supplier import SupplierGenerator
 from src.metadata.manifest import (
     build_dataset_info,
@@ -38,13 +40,15 @@ from src.models.order import SCHEMA_VERSION as ORDER_SCHEMA_VERSION
 from src.models.order_item import SCHEMA_VERSION as ORDER_ITEM_SCHEMA_VERSION
 from src.models.payment import SCHEMA_VERSION as PAYMENT_SCHEMA_VERSION
 from src.models.product import SCHEMA_VERSION as PRODUCT_SCHEMA_VERSION
+from src.models.review import SCHEMA_VERSION as REVIEW_SCHEMA_VERSION
 from src.models.supplier import SCHEMA_VERSION as SUPPLIER_SCHEMA_VERSION
 from src.writers.csv_writer import write_csv
 
 logger = logging.getLogger(__name__)
 
 KNOWN_DATASETS = {
-    "customer", "supplier", "product", "employee", "order", "order_item", "payment",
+    "customer", "supplier", "product", "employee", "order", "order_item",
+    "payment", "review",
 }
 
 # ADR-0014/0016: a child entity requires its parents in the same config.
@@ -53,6 +57,7 @@ COMPOSITION_RULES = {
     "order": ["customer", "employee"],
     "order_item": ["order", "product"],
     "payment": ["order", "order_item"],
+    "review": ["order", "order_item"],
 }
 
 
@@ -181,6 +186,29 @@ def main() -> None:
                 + item.quantity * item.unit_price
             )
         facts["totals"] = totals
+        if "review" in config.datasets:
+            completed_customer_by_order = {
+                order.order_id: (order.customer_id, order.order_date)
+                for order in orders
+                if order.status == "completed"
+            }
+            purchases = []
+            for item in items:
+                purchase = completed_customer_by_order.get(item.order_id)
+                if purchase is not None:
+                    customer_id, purchase_date = purchase
+                    purchases.append((customer_id, item.product_id, purchase_date))
+            facts["purchases"] = purchases
+
+    if "review" in config.datasets:
+        seed = seeds.child_seed(ReviewGenerator.ENTITY)
+        gen = ReviewGenerator(
+            seed=seed,
+            reference_date=config.generation.reference_date,
+            purchases=facts["purchases"],
+        )
+        _, info = _run_entity(config, gen, REVIEW_SCHEMA_VERSION, seed)
+        datasets["review"] = info
 
     if "payment" in config.datasets:
         seed = seeds.child_seed(PaymentGenerator.ENTITY)

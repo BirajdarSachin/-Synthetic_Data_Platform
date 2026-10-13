@@ -18,6 +18,7 @@ generators in FK order (ADR-0014):
   product                       (supplier count)
   order                         (customer dates + employee count, ADR-0015 context)
   order_item                    (order count + product prices, ADR-0015 context)
+  review                        (completed orders + purchased items)
   payment                       (completed orders + item totals, ADR-0015 context)
     | [WRITER]
     v

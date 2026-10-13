@@ -12,6 +12,7 @@ from src.generators.order import OrderGenerator
 from src.generators.order_item import OrderItemGenerator
 from src.generators.payment import PaymentGenerator
 from src.generators.product import ProductGenerator
+from src.generators.review import ReviewGenerator
 from src.models.order import ALLOWED_STATUSES
 
 REF = date(2026, 1, 15)
@@ -125,6 +126,46 @@ def test_order_item_price_matches_product(domain):
 def test_order_item_quantity_in_range(domain):
     _, _, _, _, items, _ = domain
     assert all(1 <= it.quantity <= 5 for it in items)
+
+
+def test_reviews_only_cover_unique_completed_purchases_and_follow_purchase_date(domain):
+    _, _, _, orders, items, _ = domain
+    completed_customer_by_order = {
+        order.order_id: (order.customer_id, order.order_date)
+        for order in orders
+        if order.status == "completed"
+    }
+    purchases = [
+        (customer_id, item.product_id, order_date)
+        for item in items
+        if item.order_id in completed_customer_by_order
+        for customer_id, order_date in [completed_customer_by_order[item.order_id]]
+    ]
+    latest_purchase_by_pair = {}
+    for customer_id, product_id, purchase_date in purchases:
+        pair = (customer_id, product_id)
+        latest_purchase_by_pair[pair] = max(
+            purchase_date, latest_purchase_by_pair.get(pair, purchase_date)
+        )
+    eligible_pairs = {
+        pair for pair, purchase_date in latest_purchase_by_pair.items()
+        if purchase_date < REF
+    }
+
+    reviews = list(ReviewGenerator(
+        seed=7, reference_date=REF, purchases=purchases
+    ).generate(len(eligible_pairs)))
+
+    reviewed_pairs = [(review.customer_id, review.product_id) for review in reviews]
+    assert set(reviewed_pairs) == eligible_pairs
+    assert len(reviewed_pairs) == len(set(reviewed_pairs))
+    assert all(
+        review.review_date > latest_purchase_by_pair[
+            (review.customer_id, review.product_id)
+        ]
+        for review in reviews
+    )
+    assert all(1 <= review.rating <= 5 for review in reviews)
 
 
 def test_payment_only_for_completed_orders(domain):

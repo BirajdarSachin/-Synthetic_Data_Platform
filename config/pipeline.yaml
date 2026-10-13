@@ -12,7 +12,7 @@ datasets:
   customer:
     records: 10000
   supplier:
-    records: 5000               # generated BEFORE product (ADR-0014 order)
+    records: 3500               # generated BEFORE product (ADR-0014 order)
   product:
     records: 3000              # FK: supplier_id in 1..supplier.records
   employee:
@@ -24,6 +24,8 @@ datasets:
   payment:
     records: 30000             # sampled from COMPLETED orders only; must not
                               # exceed their count (~70% of orders), ADR-0016
+  review:
+    records: 30000             # unique customer/product pairs from completed purchases
 
 output:
   directory: data/generated   # resolved against project root (ADR-0010)
