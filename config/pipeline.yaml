@@ -29,4 +29,4 @@ datasets:
 
 output:
   directory: data/generated   # resolved against project root (ADR-0010)
-  format: parquet
+  format: csv
