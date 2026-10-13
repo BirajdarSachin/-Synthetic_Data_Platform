@@ -9,6 +9,7 @@ Generation order follows FK dependencies (ADR-0014):
     -> order_item (needs order count + product prices)
     -> review (completed orders + purchased order items)
     -> payment (needs completed orders + item totals)
+Output layout is Hive-style (ADR-0019); writes are atomic (ADR-0020).
 main.py selects the Writer via the factory and never imports concrete writers.
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
@@ -65,10 +66,13 @@ COMPOSITION_RULES = {
 
 
 def _entity_file_path(config, entity: str) -> Path:
-    """File naming contract (ADR-0004): {entity}_{reference_date}.{format}."""
-    return config.output.directory / (
-        f"{entity}_{config.generation.reference_date}.{config.output.format}"
-    )
+    """Hive-style layout (ADR-0019):
+    {entity}/reference_date={date}/{entity}_{date}.{format}
+    The date stays in the file name so ADR-0004's naming contract holds."""
+    ref = config.generation.reference_date
+    partition = f"reference_date={ref.isoformat()}"
+    file_name = f"{entity}_{ref.isoformat()}.{config.output.format}"
+    return config.output.directory / entity / partition / file_name
 
 
 def _validate_composition(config) -> None:
@@ -105,6 +109,7 @@ def _run_entity(config, writer, generator, schema_version: str,
         schema_version=schema_version,
         records=count,
         file_path=file_path,
+        output_dir=config.output.directory,
         child_seed=child_seed,
     )
     return records, info

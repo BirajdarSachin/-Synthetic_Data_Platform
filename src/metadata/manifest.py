@@ -1,7 +1,8 @@
-"""Run manifest - the audit record of one generation run (layout: ADR-0011).
+"""Run manifest - the audit record of one generation run.
 
-A manifest answers, for every future downstream project: which config, which
-seed, which code and library versions produced this data?
+Location: ADR-0011 (_manifests/). Schema: manifest_version 2 (ADR-0019) -
+dataset entries store the output-relative POSIX path under "path" because
+partitioned file names alone no longer locate the file.
 """
 
 import hashlib
@@ -18,11 +19,14 @@ from src.core.config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
+MANIFEST_VERSION = 2
+
 
 def build_run_header(run_id: str, config: PipelineConfig, duration_s: float) -> dict[str, Any]:
     """Run-level facts. generated_at uses the REAL clock - run metadata only,
     never generated data (ADR-0003)."""
     return {
+        "manifest_version": MANIFEST_VERSION,
         "run_id": run_id,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "platform_version": __version__,
@@ -38,13 +42,18 @@ def build_run_header(run_id: str, config: PipelineConfig, duration_s: float) -> 
 
 
 def build_dataset_info(entity: str, schema_version: str, records: int,
-                       file_path: Path, child_seed: int) -> dict[str, Any]:
-    """Facts about one generated dataset - including a checksum of its file."""
+                       file_path: Path, output_dir: Path,
+                       child_seed: int) -> dict[str, Any]:
+    """Facts about one generated dataset - including a checksum of its file.
+
+    ADR-0019: "path" is relative to the output directory with POSIX
+    separators - stable across operating systems and manifest readers.
+    """
     return {
         "entity": entity,
         "schema_version": schema_version,
         "records": records,
-        "file": file_path.name,
+        "path": file_path.relative_to(output_dir).as_posix(),
         "file_bytes": file_path.stat().st_size,
         "file_sha256": _sha256_of(file_path),
         "child_seed": child_seed,
