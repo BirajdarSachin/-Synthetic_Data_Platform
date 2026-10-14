@@ -25,6 +25,9 @@ DEFAULT_HISTORY = "3y"
 _DURATION_UNIT_DAYS = {"y": 365, "m": 30, "d": 1}
 _DURATION_TOKEN = re.compile(r"\d+[ymd]")
 
+WINDOW_GRANULARITIES = ("daily", "monthly")
+WINDOW_MODES = ("full", "latest")
+
 
 class ConfigError(Exception):
     """Raised when a configuration file is missing or invalid."""
@@ -36,9 +39,18 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
+class WindowConfig:
+    """Windowed generation (ADR-0024). Absent = single snapshot file."""
+
+    granularity: str  # "daily" | "monthly"
+    mode: str         # "full" | "latest"
+
+
+@dataclass(frozen=True)
 class GenerationConfig:
     reference_date: date
     history_days: int
+    window: WindowConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -147,13 +159,38 @@ def _parse_run(section: object) -> RunConfig:
     return RunConfig(seed=seed)
 
 
+def _parse_window(section: object) -> WindowConfig | None:
+    """Parse the optional generation.window section (ADR-0024)."""
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ConfigError("generation.window must be a mapping")
+    granularity = section.get("granularity")
+    if granularity not in WINDOW_GRANULARITIES:
+        raise ConfigError(
+            f"generation.window.granularity must be one of "
+            f"{WINDOW_GRANULARITIES}, got {granularity!r}"
+        )
+    mode = section.get("mode", "full")
+    if mode not in WINDOW_MODES:
+        raise ConfigError(
+            f"generation.window.mode must be one of {WINDOW_MODES}, "
+            f"got {mode!r}"
+        )
+    return WindowConfig(granularity=granularity, mode=mode)
+
+
 def _parse_generation(section: object) -> GenerationConfig:
     if not isinstance(section, dict) or "reference_date" not in section:
         raise ConfigError("Missing required section/key: generation.reference_date")
     value = section["reference_date"]
     if isinstance(value, date):
         history_days = parse_duration_to_days(section.get("history", DEFAULT_HISTORY))
-        return GenerationConfig(reference_date=value, history_days=history_days)
+        return GenerationConfig(
+            reference_date=value,
+            history_days=history_days,
+            window=_parse_window(section.get("window")),
+        )
     raise ConfigError("generation.reference_date must be a date in YYYY-MM-DD form")
 
 
@@ -193,7 +230,6 @@ def _parse_rate(section: dict, key: str, default: float | None = None) -> float:
 
 
 def _parse_string_list(section: dict, dataset: str, key: str) -> list[str]:
-    """Parse a required-shape list of non-empty column names."""
     raw = section.get(key, [])
     if not isinstance(raw, list) or not all(isinstance(f, str) and f for f in raw):
         raise ConfigError(
@@ -203,7 +239,6 @@ def _parse_string_list(section: dict, dataset: str, key: str) -> list[str]:
 
 
 def _reject_identifiers(dataset: str, key: str, fields: list[str]) -> None:
-    """Identifier fields are protected: null/out-of-range/drop forbid them."""
     ids = [f for f in fields if f.endswith("_id")]
     if ids:
         raise ConfigError(
@@ -271,8 +306,7 @@ def _parse_quality(section: object) -> QualityConfig | None:
         if both:
             raise ConfigError(
                 f"quality.datasets.{name}: column(s) {both} appear in both "
-                "drop_fields and extra_fields - cannot drop and add the "
-                "same column (ADR-0023)"
+                "drop_fields and extra_fields (ADR-0023)"
             )
 
         datasets[name] = QualityDatasetConfig(
@@ -297,6 +331,12 @@ def _log_resolved(config: PipelineConfig) -> None:
     logger.info("[CONFIG] seed=%s", config.run.seed)
     logger.info("[CONFIG] reference_date=%s", config.generation.reference_date.isoformat())
     logger.info("[CONFIG] history_days=%s", config.generation.history_days)
+    window = config.generation.window
+    if window is None:
+        logger.info("[CONFIG] window=none (single snapshot per entity)")
+    else:
+        logger.info("[CONFIG] window granularity=%s mode=%s",
+                    window.granularity, window.mode)
     for dataset in config.datasets.values():
         logger.info("[CONFIG] dataset=%s records=%s", dataset.name, dataset.records)
     logger.info("[CONFIG] output.directory=%s", config.output.directory)

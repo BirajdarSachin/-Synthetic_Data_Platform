@@ -24,15 +24,18 @@
 - [x] Atomic writes inside the Writer lifecycle (ADR-0020) (Milestone 4c)
 
 ## PHASE 4 - Impurity engine - COMPLETE (platform 1.0.0)
-- [x] Engine skeleton: stream transform, quality config, guard, seeds (ADR-0021) (5a)
-- [x] NULL injection rule + format behavior (5a)
-- [x] Duplicate record rule: delayed exact-copy re-emission (ADR-0022) (5b)
-- [x] Invalid FK rule: out-of-range ids, explicit parent mapping (ADR-0022) (5b)
-- [x] Fixed rule chain: null -> invalid_fk -> duplicate (ADR-0022) (5b)
-- [x] Out-of-range rule: negation on numeric fields (ADR-0023) (5c)
-- [x] Schema drift rule: drop/extra columns via dynamic dataclasses (ADR-0023) (5c)
+- [x] Engine skeleton + NULL injection (ADR-0021) (5a)
+- [x] Duplicate + invalid-FK rules, fixed chain (ADR-0022) (5b)
+- [x] Out-of-range + schema-drift rules (ADR-0023) (5c)
 
-## PHASE 5 - Temporal & incremental (window engine, granularity, INSERT/UPDATE/DELETE, CDC-style)
+## PHASE 5 - Temporal & incremental
+- [x] Window engine: daily/monthly keys, bucketing, event_date partitions (ADR-0024) (6a)
+- [x] Fact/dimension split; snapshot vs windowed output (ADR-0024) (6a)
+- [x] Temporal integrity across windows (inherited from ADR-0016) (6a)
+- [x] Manifest v3: layout + files[] (ADR-0024) (6a)
+- [ ] Incremental change stream: INSERT/UPDATE/DELETE (Milestone 6b)
+- [ ] CDC-style change log format (Milestone 6b)
+
 ## PHASE 6 - Event streams (event_time vs ingestion_time, late/duplicate/out-of-order)
-## PHASE 7 - Scale (streaming context, chunking, multiprocessing)
+## PHASE 7 - Scale (per-window independent generation, streaming context, chunking, multiprocessing)
 ## PHASE 8 - Production readiness (packaging, CLI, metadata catalog, CI)

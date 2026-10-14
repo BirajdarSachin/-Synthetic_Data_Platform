@@ -1,10 +1,12 @@
 """Entry point - wires the stages together. No business logic lives here.
 
-Pipeline: config -> seed -> generate -> impurity engine (optional, ADR-0021..0023)
-          -> write (format from config, ADR-0017) -> manifest.
+Pipeline: config -> seed -> generate -> impurity engine (optional) -> write
+          (snapshot or windowed, ADR-0024) -> manifest.
 Generation order follows FK dependencies (ADR-0014); context (ADR-0015) is
 always extracted from CLEAN records - corruption is local to written files.
-Output layout is Hive-style (ADR-0019); writes are atomic (ADR-0020).
+Windowed mode (ADR-0024): fact entities are bucketed by business date into
+event_date= partitions; dimension entities (supplier, product) stay
+snapshots. Temporal integrity across windows is inherited from ADR-0016.
 Failures are logged to the run log and reported via exit codes:
   0 = success, 1 = failure, 130 = interrupted (Ctrl+C).
 """
@@ -19,6 +21,7 @@ from src.core.config import ConfigError, load_config
 from src.core.logging_setup import configure_logging, get_run_id
 from src.core.paths import resolve_path
 from src.core.seed_manager import SeedManager
+from src.core.windows import compute_window_keys, window_key_for
 from src.generators.customer import CustomerGenerator
 from src.generators.employee import EmployeeGenerator
 from src.generators.order import OrderGenerator
@@ -29,6 +32,7 @@ from src.generators.review import ReviewGenerator
 from src.generators.supplier import SupplierGenerator
 from src.metadata.manifest import (
     build_dataset_info,
+    build_file_info,
     build_run_header,
     write_manifest,
 )
@@ -50,6 +54,7 @@ KNOWN_DATASETS = {
     "payment", "review",
 }
 
+# ADR-0014/0016: a child entity requires its parents in the same config.
 COMPOSITION_RULES = {
     "product": ["supplier"],
     "order": ["customer", "employee"],
@@ -58,15 +63,35 @@ COMPOSITION_RULES = {
     "review": ["order", "order_item"],
 }
 
+# ADR-0024: fact entities are windowed by their business date; dimension
+# entities (supplier, product) remain snapshots. order_item is bucketed via
+# its order's date (handled separately - it has no date of its own).
+WINDOW_DATE_FIELDS = {
+    "customer": "registration_date",
+    "employee": "hire_date",
+    "order": "order_date",
+    "payment": "payment_date",
+    "review": "review_date",
+}
+
+# ADR-0021: corrupted runs must never overwrite the clean baseline.
 _CLEAN_BASELINE = resolve_path(Path("data/generated"))
 
 
-def _entity_file_path(config, entity: str) -> Path:
-    """Hive-style layout (ADR-0019):
+def _snapshot_file_path(config, entity: str) -> Path:
+    """Snapshot layout (ADR-0019):
     {entity}/reference_date={date}/{entity}_{date}.{format}"""
     ref = config.generation.reference_date
     partition = f"reference_date={ref.isoformat()}"
     file_name = f"{entity}_{ref.isoformat()}.{config.output.format}"
+    return config.output.directory / entity / partition / file_name
+
+
+def _windowed_file_path(config, entity: str, window_key: str) -> Path:
+    """Windowed layout (ADR-0024):
+    {entity}/event_date={window_key}/{entity}_{window_key}.{format}"""
+    partition = f"event_date={window_key}"
+    file_name = f"{entity}_{window_key}.{config.output.format}"
     return config.output.directory / entity / partition / file_name
 
 
@@ -118,29 +143,43 @@ def _validate_quality_output(config) -> None:
                 )
 
 
-def _run_entity(config, writer, engine, generator, schema_version: str,
-                child_seed: int) -> tuple[list, dict]:
-    """Generate, (optionally) corrupt, write; build manifest info.
+def _write_records(config, writer, engine, entity: str, records: list,
+                   window_keys: list[str] | None = None,
+                   key_of=None) -> tuple[str, list[dict]]:
+    """Write one entity's clean records as snapshot or windowed files.
 
-    Returns the CLEAN records so facts/context extraction (ADR-0015) never
-    sees corrupted values - corruption is local to written files (ADR-0021).
-    With the duplicate rule, the written count can exceed the generated
-    count - the manifest records the WRITTEN count.
+    Returns (layout, files). In windowed mode, records are bucketed by
+    their business-date window key (clean values - corruption never moves
+    a record between windows, ADR-0024) and the engine applies per window
+    stream with a per-window seed scope. mode="latest" keeps only the
+    requested window; mode="full" treats an out-of-range date as a bug.
     """
-    cfg = config.datasets[generator.ENTITY]
-    file_path = _entity_file_path(config, generator.ENTITY)
-    records = list(generator.generate(cfg.records))
-    stream = engine.apply(generator.ENTITY, iter(records)) if engine else iter(records)
-    count = writer.write(file_path, stream)
-    info = build_dataset_info(
-        entity=generator.ENTITY,
-        schema_version=schema_version,
-        records=count,
-        file_path=file_path,
-        output_dir=config.output.directory,
-        child_seed=child_seed,
-    )
-    return records, info
+    window_cfg = config.generation.window
+    if window_cfg is None or key_of is None:
+        path = _snapshot_file_path(config, entity)
+        stream = engine.apply(entity, iter(records)) if engine else iter(records)
+        count = writer.write(path, stream)
+        return "snapshot", [build_file_info(path, config.output.directory, count)]
+
+    buckets: dict[str, list] = {}
+    for record in records:
+        key = key_of(record)
+        if key not in set(window_keys):
+            if window_cfg.mode == "full":
+                raise ValueError(
+                    f"{entity} maps to window {key!r} outside the configured "
+                    "window range - generation bug")
+            continue  # mode="latest": keep only the requested window
+        buckets.setdefault(key, []).append(record)
+
+    files = []
+    for key in sorted(buckets):
+        path = _windowed_file_path(config, entity, key)
+        stream = (engine.apply(entity, iter(buckets[key]), scope=key)
+                  if engine else iter(buckets[key]))
+        count = writer.write(path, stream)
+        files.append(build_file_info(path, config.output.directory, count))
+    return "windowed", files
 
 
 def main() -> None:
@@ -159,8 +198,16 @@ def main() -> None:
     _validate_composition(config)
     _validate_quality_output(config)
 
+    window_cfg = config.generation.window
+    windowed = window_cfg is not None
+    gran = window_cfg.granularity if windowed else None
+    window_keys = (compute_window_keys(
+        config.generation.reference_date, config.generation.history_days,
+        gran, window_cfg.mode) if windowed else None)
+
     datasets: dict[str, dict] = {}
     facts: dict = {}
+    order_date_by_id: dict[int, object] | None = None
 
     if "customer" in config.datasets:
         seed = seeds.child_seed(CustomerGenerator.ENTITY)
@@ -169,16 +216,26 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        customers, info = _run_entity(
-            config, writer, engine, gen, CUSTOMER_SCHEMA_VERSION, seed)
-        datasets["customer"] = info
+        customers = list(gen.generate(config.datasets["customer"].records))
+        key_of = (lambda r: window_key_for(r.registration_date, gran)
+                  if windowed else None)
+        layout, files = _write_records(
+            config, writer, engine, "customer", customers,
+            window_keys, key_of)
+        datasets["customer"] = build_dataset_info(
+            entity="customer", schema_version=CUSTOMER_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
         facts["customers"] = [(c.customer_id, c.registration_date) for c in customers]
 
     if "supplier" in config.datasets:
         seed = seeds.child_seed(SupplierGenerator.ENTITY)
         gen = SupplierGenerator(seed=seed)
-        _, info = _run_entity(config, writer, engine, gen, SUPPLIER_SCHEMA_VERSION, seed)
-        datasets["supplier"] = info
+        suppliers = list(gen.generate(config.datasets["supplier"].records))
+        layout, files = _write_records(
+            config, writer, engine, "supplier", suppliers)  # always snapshot
+        datasets["supplier"] = build_dataset_info(
+            entity="supplier", schema_version=SUPPLIER_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
 
     if "product" in config.datasets:
         seed = seeds.child_seed(ProductGenerator.ENTITY)
@@ -186,9 +243,12 @@ def main() -> None:
             seed=seed,
             supplier_count=config.datasets["supplier"].records,
         )
-        products, info = _run_entity(
-            config, writer, engine, gen, PRODUCT_SCHEMA_VERSION, seed)
-        datasets["product"] = info
+        products = list(gen.generate(config.datasets["product"].records))
+        layout, files = _write_records(
+            config, writer, engine, "product", products)  # always snapshot
+        datasets["product"] = build_dataset_info(
+            entity="product", schema_version=PRODUCT_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
         facts["products"] = [(p.product_id, p.unit_price) for p in products]
 
     if "employee" in config.datasets:
@@ -198,8 +258,14 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             history_days=config.generation.history_days,
         )
-        _, info = _run_entity(config, writer, engine, gen, EMPLOYEE_SCHEMA_VERSION, seed)
-        datasets["employee"] = info
+        employees = list(gen.generate(config.datasets["employee"].records))
+        key_of = (lambda r: window_key_for(r.hire_date, gran)
+                  if windowed else None)
+        layout, files = _write_records(
+            config, writer, engine, "employee", employees, window_keys, key_of)
+        datasets["employee"] = build_dataset_info(
+            entity="employee", schema_version=EMPLOYEE_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
 
     if "order" in config.datasets:
         seed = seeds.child_seed(OrderGenerator.ENTITY)
@@ -209,11 +275,19 @@ def main() -> None:
             customers=facts["customers"],
             employee_count=config.datasets["employee"].records,
         )
-        orders, info = _run_entity(config, writer, engine, gen, ORDER_SCHEMA_VERSION, seed)
-        datasets["order"] = info
+        orders = list(gen.generate(config.datasets["order"].records))
+        key_of = (lambda r: window_key_for(r.order_date, gran)
+                  if windowed else None)
+        layout, files = _write_records(
+            config, writer, engine, "order", orders, window_keys, key_of)
+        datasets["order"] = build_dataset_info(
+            entity="order", schema_version=ORDER_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
         facts["completed_orders"] = [
             (o.order_id, o.order_date) for o in orders if o.status == "completed"
         ]
+        if windowed and "order_item" in config.datasets:
+            order_date_by_id = {o.order_id: o.order_date for o in orders}
 
     if "order_item" in config.datasets:
         seed = seeds.child_seed(OrderItemGenerator.ENTITY)
@@ -222,9 +296,16 @@ def main() -> None:
             order_count=config.datasets["order"].records,
             products=facts["products"],
         )
-        items, info = _run_entity(
-            config, writer, engine, gen, ORDER_ITEM_SCHEMA_VERSION, seed)
-        datasets["order_item"] = info
+        items = list(gen.generate(config.datasets["order_item"].records))
+        key_of = None
+        if windowed:
+            key_of = (lambda it: window_key_for(
+                order_date_by_id[it.order_id], gran))
+        layout, files = _write_records(
+            config, writer, engine, "order_item", items, window_keys, key_of)
+        datasets["order_item"] = build_dataset_info(
+            entity="order_item", schema_version=ORDER_ITEM_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
         totals: dict[int, Decimal] = {}
         for item in items:
             totals[item.order_id] = (
@@ -253,8 +334,14 @@ def main() -> None:
             reference_date=config.generation.reference_date,
             purchases=facts["purchases"],
         )
-        _, info = _run_entity(config, writer, engine, gen, REVIEW_SCHEMA_VERSION, seed)
-        datasets["review"] = info
+        reviews = list(gen.generate(config.datasets["review"].records))
+        key_of = (lambda r: window_key_for(r.review_date, gran)
+                  if windowed else None)
+        layout, files = _write_records(
+            config, writer, engine, "review", reviews, window_keys, key_of)
+        datasets["review"] = build_dataset_info(
+            entity="review", schema_version=REVIEW_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
 
     if "payment" in config.datasets:
         seed = seeds.child_seed(PaymentGenerator.ENTITY)
@@ -264,8 +351,14 @@ def main() -> None:
             completed_orders=facts["completed_orders"],
             totals=facts["totals"],
         )
-        _, info = _run_entity(config, writer, engine, gen, PAYMENT_SCHEMA_VERSION, seed)
-        datasets["payment"] = info
+        payments = list(gen.generate(config.datasets["payment"].records))
+        key_of = (lambda r: window_key_for(r.payment_date, gran)
+                  if windowed else None)
+        layout, files = _write_records(
+            config, writer, engine, "payment", payments, window_keys, key_of)
+        datasets["payment"] = build_dataset_info(
+            entity="payment", schema_version=PAYMENT_SCHEMA_VERSION,
+            layout=layout, files=files, child_seed=seed)
 
     manifest = build_run_header(
         run_id=get_run_id(), config=config, duration_s=time.perf_counter() - start

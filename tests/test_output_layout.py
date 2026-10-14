@@ -1,4 +1,4 @@
-"""Milestone 4c tests: Hive layout, atomic writes, manifest v2 paths."""
+"""Milestone 4c tests: Hive layout, atomic writes; updated for manifest v3."""
 
 from datetime import date
 from pathlib import Path
@@ -14,7 +14,12 @@ from src.core.config import (
     PipelineConfig,
     RunConfig,
 )
-from src.metadata.manifest import build_dataset_info, build_run_header
+from src.metadata.manifest import (
+    MANIFEST_VERSION,
+    build_dataset_info,
+    build_file_info,
+    build_run_header,
+)
 from src.models.customer import Customer
 from src.writers import get_writer
 from src.writers.base import Writer
@@ -42,10 +47,17 @@ def _two_customers() -> list[Customer]:
     ]
 
 
-def test_path_builder_produces_hive_layout():
-    path = entry._entity_file_path(_FakeConfig(), "customer")
+def test_snapshot_path_builder_produces_hive_layout():
+    path = entry._snapshot_file_path(_FakeConfig(), "customer")
     assert path.as_posix().endswith(
         "customer/reference_date=2026-01-15/customer_2026-01-15.csv"
+    )
+
+
+def test_windowed_path_builder_produces_event_date_partition():
+    path = entry._windowed_file_path(_FakeConfig(), "order", "2025-10-01")
+    assert path.as_posix().endswith(
+        "order/event_date=2025-10-01/order_2025-10-01.csv"
     )
 
 
@@ -96,20 +108,22 @@ def test_overwrite_still_works_through_replace(tmp_path: Path):
     assert not (tmp_path / "customer_2026-01-15.csv.tmp").exists()
 
 
-def test_manifest_info_uses_output_relative_path(tmp_path: Path):
+def test_manifest_file_info_uses_output_relative_path(tmp_path: Path):
     out_dir = tmp_path / "generated"
-    file_path = (out_dir / "customer" / "reference_date=2026-01-15"
+    file_path = (out_dir / "customer" / "event_date=2026-01-15"
                  / "customer_2026-01-15.csv")
     file_path.parent.mkdir(parents=True)
     file_path.write_text("x", encoding="utf-8")
+    file_info = build_file_info(file_path, out_dir, records=1)
+    assert file_info["path"] == (
+        "customer/event_date=2026-01-15/customer_2026-01-15.csv"
+    )
     info = build_dataset_info(
-        entity="customer", schema_version="1.0", records=1,
-        file_path=file_path, output_dir=out_dir, child_seed=1,
+        entity="customer", schema_version="1.0", layout="windowed",
+        files=[file_info], child_seed=1,
     )
-    assert info["path"] == (
-        "customer/reference_date=2026-01-15/customer_2026-01-15.csv"
-    )
-    assert "file" not in info
+    assert info["records"] == 1
+    assert "path" not in info  # v3: paths live inside files[]
 
 
 def test_manifest_header_carries_schema_version(tmp_path: Path):
@@ -121,4 +135,5 @@ def test_manifest_header_carries_schema_version(tmp_path: Path):
         output=OutputConfig(directory=tmp_path, format="csv"),
     )
     header = build_run_header(run_id="run_test", config=config, duration_s=0.5)
-    assert header["manifest_version"] == 2
+    assert header["manifest_version"] == MANIFEST_VERSION == 3
+    assert header["window"] is None  # snapshot mode

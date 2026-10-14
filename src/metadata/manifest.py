@@ -1,8 +1,9 @@
 """Run manifest - the audit record of one generation run.
 
-Location: ADR-0011 (_manifests/). Schema: manifest_version 2 (ADR-0019) -
-dataset entries store the output-relative POSIX path under "path" because
-partitioned file names alone no longer locate the file.
+Location: ADR-0011 (_manifests/). Schema: manifest_version 3 (ADR-0024) -
+each dataset entry carries "layout" ("snapshot" | "windowed") and a
+"files" array with per-file path (output-relative, POSIX), records, bytes
+and sha256; the run header carries the optional "window" config.
 """
 
 import hashlib
@@ -19,12 +20,13 @@ from src.core.config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 
 
 def build_run_header(run_id: str, config: PipelineConfig, duration_s: float) -> dict[str, Any]:
     """Run-level facts. generated_at uses the REAL clock - run metadata only,
     never generated data (ADR-0003)."""
+    window = config.generation.window
     return {
         "manifest_version": MANIFEST_VERSION,
         "run_id": run_id,
@@ -35,27 +37,39 @@ def build_run_header(run_id: str, config: PipelineConfig, duration_s: float) -> 
         "master_seed": config.run.seed,
         "reference_date": config.generation.reference_date.isoformat(),
         "history_days": config.generation.history_days,
+        "window": None if window is None else {
+            "granularity": window.granularity,
+            "mode": window.mode,
+        },
         "config_file": str(config.config_file),
         "output_format": config.output.format,
         "duration_s": round(duration_s, 2),
     }
 
 
-def build_dataset_info(entity: str, schema_version: str, records: int,
-                       file_path: Path, output_dir: Path,
-                       child_seed: int) -> dict[str, Any]:
-    """Facts about one generated dataset - including a checksum of its file.
+def build_file_info(file_path: Path, output_dir: Path, records: int) -> dict[str, Any]:
+    """Facts about one written file - checksum, size, output-relative path."""
+    return {
+        "path": file_path.relative_to(output_dir).as_posix(),
+        "records": records,
+        "file_bytes": file_path.stat().st_size,
+        "file_sha256": _sha256_of(file_path),
+    }
 
-    ADR-0019: "path" is relative to the output directory with POSIX
-    separators - stable across operating systems and manifest readers.
+
+def build_dataset_info(entity: str, schema_version: str, layout: str,
+                       files: list[dict[str, Any]], child_seed: int) -> dict[str, Any]:
+    """Facts about one generated dataset (ADR-0024, manifest v3).
+
+    records is the WRITTEN total across files (with the duplicate rule it
+    can exceed the generated count - downstream consumers receive files).
     """
     return {
         "entity": entity,
         "schema_version": schema_version,
-        "records": records,
-        "path": file_path.relative_to(output_dir).as_posix(),
-        "file_bytes": file_path.stat().st_size,
-        "file_sha256": _sha256_of(file_path),
+        "layout": layout,
+        "records": sum(f["records"] for f in files),
+        "files": files,
         "child_seed": child_seed,
     }
 

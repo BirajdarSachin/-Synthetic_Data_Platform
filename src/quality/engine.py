@@ -1,13 +1,11 @@
 """Impurity engine - applies the configured rule chain to record streams.
 
 Fixed chain per entity (ADR-0022/0023):
-  1. null injection     (one configured non-id field -> None)
-  2. invalid FK         (one *_id field -> out-of-range id)
-  3. out-of-range value (one numeric field -> negated)
-  4. schema drift       (record shape changes: drop/extra fields)
-  5. duplication        (exact copy re-emitted after a delay) - LAST, so
-    duplicates are exact copies of fully-corrupted records.
-Each rule has its own child seed "{entity}:quality:{rule}" (ADR-0021).
+  1. null injection     2. invalid FK   3. out-of-range
+  4. schema drift       5. duplicate (LAST - exact copies of corrupted records)
+Each rule has its own child seed "{entity}:quality:{rule}" (ADR-0021), or
+"{entity}:{scope}:quality:{rule}" when a window scope is supplied
+(ADR-0024) - corruption is independent per window.
 """
 
 import logging
@@ -33,8 +31,12 @@ class ImpurityEngine:
         self._quality = quality
         self._dataset_counts = dataset_counts
 
-    def apply(self, entity: str, records: Iterator[Any]) -> Iterator[Any]:
-        """Return a (possibly corrupted) stream. Passthrough when unconfigured."""
+    def apply(self, entity: str, records: Iterator[Any],
+              scope: str | None = None) -> Iterator[Any]:
+        """Return a (possibly corrupted) stream. Passthrough when unconfigured.
+
+        scope: window key for per-window seed derivation (ADR-0024)."""
+        prefix = f"{entity}:{scope}" if scope else entity
         spec = self._quality.datasets.get(entity)
         if spec is None:
             return records
@@ -42,7 +44,7 @@ class ImpurityEngine:
         if spec.null_fields and self._quality.null_rate > 0.0:
             stream = NullInjectionRule(
                 entity=entity,
-                seed=self._seed_manager.child_seed(f"{entity}:quality:null"),
+                seed=self._seed_manager.child_seed(f"{prefix}:quality:null"),
                 null_fields=spec.null_fields,
                 rate=self._quality.null_rate,
             ).apply(stream)
@@ -50,7 +52,7 @@ class ImpurityEngine:
             stream = InvalidForeignKeyRule(
                 entity=entity,
                 seed=self._seed_manager.child_seed(
-                    f"{entity}:quality:invalid_fk"),
+                    f"{prefix}:quality:invalid_fk"),
                 fk_specs=self._parent_counts(entity, spec.invalid_fk_fields),
                 rate=self._quality.invalid_fk_rate,
             ).apply(stream)
@@ -58,7 +60,7 @@ class ImpurityEngine:
             stream = OutOfRangeRule(
                 entity=entity,
                 seed=self._seed_manager.child_seed(
-                    f"{entity}:quality:out_of_range"),
+                    f"{prefix}:quality:out_of_range"),
                 target_fields=spec.out_of_range_fields,
                 rate=self._quality.out_of_range_rate,
             ).apply(stream)
@@ -67,7 +69,7 @@ class ImpurityEngine:
             stream = SchemaDriftRule(
                 entity=entity,
                 seed=self._seed_manager.child_seed(
-                    f"{entity}:quality:drift"),
+                    f"{prefix}:quality:drift"),
                 drop_fields=spec.drop_fields,
                 extra_fields=spec.extra_fields,
                 rate=self._quality.drift_rate,
@@ -76,7 +78,7 @@ class ImpurityEngine:
             stream = DuplicateRule(
                 entity=entity,
                 seed=self._seed_manager.child_seed(
-                    f"{entity}:quality:duplicate"),
+                    f"{prefix}:quality:duplicate"),
                 rate=self._quality.duplicate_rate,
             ).apply(stream)
         return stream
