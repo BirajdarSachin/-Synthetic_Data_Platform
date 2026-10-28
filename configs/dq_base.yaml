@@ -1,13 +1,28 @@
 # =============================================================================
-# dq_base.yaml -- DQ check configuration (Milestone 7a, v3 -- ADR-025)
+# dq_base.yaml -- DQ check configuration (Milestone 7b, v4 -- ADR-025/026)
 #
-# v3: entity names aligned with THIS repository's real schema (singular names:
-# order, order_item, employee, review, payment, customer; the generation log
-# reported datasets=8 -- add any entity still missing below, same shape).
-#
-# The harness now VALIDATES every configured column against each entity's
-# real CSV header at startup and fail-fasts printing the actual header, so a
-# wrong column guess is a guided one-line fix, never a silent misfire.
+# v4 adds three checks to the 7a suite (all default-enabled when absent from
+# dq.checks, so upgrading needs NO config edits):
+#   duplicate_rows -- exact full-row copies within one file. The impurity
+#                     engine's duplicate rule makes exact copies, so this
+#                     fires on data/corrupted alongside pk_unique with zero
+#                     extra config (one violation per extra copy).
+#   row_count      -- per-file size expectation: 'expected: N' (exact) or
+#                     'min'/'max' bounds. customer is wired below from the
+#                     accepted 7a drill (1000 clean rows; the corrupted tree
+#                     holds 1023, so this check now fires there too). Wire
+#                     the rest from the clean run's data/dq/report.json
+#                     (rows_checked per file).
+#   pk_union       -- OPT-IN per entity ('pk_union: true'): a primary key
+#                     must not appear in MORE THAN ONE file/window. Off by
+#                     default because SCD-style snapshots legitimately repeat
+#                     keys across reference_date windows. Needs >= 2 files.
+# Per-entity gate: add 'checks: [name, ...]' to an entity to run ONLY those
+# checks for it (unknown names are a startup error). A check runs iff its
+# global toggle is enabled AND the entity config provides what it needs AND
+# (no whitelist or the whitelist contains it).
+# Parquet input is deferred to 7c -- it needs a reader-dependency decision;
+# the harness stays stdlib + PyYAML until that ADR lands.
 #
 # Drills on this machine (quality root is data/corrupted per your [WRITER] log):
 #   clean    .venv\Scripts\python.exe dq_main.py --tree data\generated  --mode clean
@@ -27,19 +42,28 @@ dq:
       enabled: true          # numeric columns must sit inside declared ranges
     pk_unique:
       enabled: true          # primary keys must not repeat within a file
+    duplicate_rows:
+      enabled: true          # exact full-row copies within a file (7b)
+    row_count:
+      enabled: true          # per-file size bounds where configured (7b)
+    pk_union:
+      enabled: true          # cross-window PK union where opted in (7b)
 
   entities:
-    # --- customer: guessed from order's invalid_fk rule firing; the startup
-    # header check confirms or corrects the pk name on first run.
+    # --- customer: confirmed by the accepted 7a drill (1000 clean rows;
+    # 1023 in data/corrupted -> pk_unique fired 23).
     customer:
       primary_key: customer_id
       required: [customer_id]
+      row_count: {expected: 1000}   # 7b: fires on data/corrupted (1023 != 1000)
 
     order:
       primary_key: order_id
       required: [order_id]
       foreign_keys:
         customer_id: customer   # TODO verify column + parent against the real header
+      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+      # pk_union: true               # only if keys must be unique ACROSS windows
 
     order_item:
       primary_key: order_item_id
@@ -48,18 +72,22 @@ dq:
       # business range once confirmed from the header, e.g.:
       # ranges:
       #   quantity: {min: 1, max: 100, type: int}
+      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
 
     employee:
       primary_key: employee_id
       required: [employee_id]
+      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
 
     review:
       primary_key: review_id
       required: [review_id]
+      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
 
     payment:
       primary_key: payment_id
       required: [payment_id]
+      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
 
     # --- datasets=8 in your log: add the remaining entities here, same shape.
     # Null rule fired on order (57 rows): once you know WHICH column was

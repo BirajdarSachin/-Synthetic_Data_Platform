@@ -198,3 +198,80 @@ the acceptance drill from the operator guide (§11), currently run by hand.
 - Corrupted trees are *expected* to fail `--mode clean`; failing there is the
   success signal. Tooling that consumes this harness must pass the mode
   explicitly rather than assume one.
+# ADR text for docs/decisions.md (appended by bootstrap_milestone7b.py)
+
+---
+
+## ADR-026 — DQ harness 7b: full-row duplicates, row_count bounds, cross-window pk_union, per-entity check gates
+
+**Status:** Accepted (Milestone 7b)
+
+**Context.** Milestone 7a delivered the DQ harness as an output-tree consumer
+(ADR-025) with a fixed 4-check suite, and the acceptance drill went green on
+the real machine: the clean tree passed with zero violations and the
+corrupted tree fired `pk_unique` (356 times) and `fk_integrity` (19 times).
+The drill also showed what was left on the table: the duplicate rule's row
+growth was only visible through its PK shadow, no check guarded file sizes,
+nothing could prove key uniqueness across snapshot windows, and there was no
+way to switch a check off for a single entity. Parquet support was deferred
+when 7a shipped.
+
+**Decision.**
+1. **`duplicate_rows`** joins the suite (default on). Per file, a row that is
+   an exact copy of an earlier row (ALL columns, order-stable comparison,
+   None normalised to empty string) is a violation; each extra copy counts
+   once, matching `pk_unique` semantics. It complements rather than replaces
+   `pk_unique`: key-uniqueness and record-copy-ness are different questions
+   a downstream consumer is entitled to ask separately. On the impurity
+   engine's output both fire, because the duplicate rule appends exact
+   copies (interaction Law 4).
+2. **`row_count`** joins the suite (default on, but only runs where an
+   entity configures `row_count:`). Config accepts `expected: N` (exact) or
+   inclusive `min`/`max` bounds; mixing `expected` with bounds is a startup
+   error, as are unknown keys, non-integers, negatives, and `min > max`.
+   The expectation is PER FILE (per snapshot window). A violation is
+   file-level: `row_number=0`, one violation regardless of file size.
+   `customer` ships wired to `expected: 1000` in `dq_base.yaml` v4 — proven
+   by the accepted drill (clean 1000, corrupted 1023).
+3. **`pk_union`** joins the suite as an entity-level, OPT-IN check
+   (`pk_union: true` on the entity, plus the global toggle). A primary key
+   appearing in MORE THAN ONE file of the entity is a violation listing the
+   files; empty keys are skipped (Law 2: emptiness is `not_null`/`pk_unique`'
+   business). Opt-in because SCD-style snapshot windows legitimately repeat
+   keys across `reference_date` windows. Needs >= 2 files; otherwise the
+   runner logs a skip line. The result is entity-level with
+   `file='(cross-file union)'`; the runner drives it because its state spans
+   files — this is the documented exception to "a Check consumes one file".
+4. **Per-entity check gates.** An entity MAY carry `checks: [name, ...]` —
+   a whitelist intersected with the global toggles and the config-presence
+   rule. A check runs iff (global toggle on) AND (entity config provides
+   what it needs) AND (whitelist absent or contains it). Unknown whitelist
+   names and an empty whitelist are startup errors with the known-checks
+   list printed.
+5. **Report accounting decoupled from check execution.** `files_checked`
+   and `rows_checked` are counted from the files actually read, no longer
+   derived from which checks produced results — gating checks off per entity
+   can no longer change what the report says about the tree's size.
+   `REPORT_VERSION` stays 1: the JSON shape is unchanged.
+6. **Parquet input is deferred to 7c.** Reading Parquet requires a reader
+   dependency (pyarrow/pandas); the harness stays stdlib + PyYAML until that
+   decision has its own ADR. The CSV-only consumer contract is unchanged.
+
+**Consequences.**
+- Existing 7a configs gain `duplicate_rows` behaviour automatically
+  (default-on, no config key needed). This is a documented behaviour change:
+  corrupted trees now report MORE violations. On the accepted drill the
+  corrupt run goes from 375 to ~732 (356 full-row duplicate copies + 1
+  customer `row_count` bound); the clean run stays at exactly 0. Machines
+  that need the old shape set `dq.checks.duplicate_rows.enabled: false`.
+- The `CHECK_NAMES` tuple grows to seven and remains the config contract:
+  unknown names in `dq.checks` or in an entity whitelist fail at startup,
+  listing the known checks.
+- `row_count: {expected: N}` couples the config to generated volumes; the
+  yaml comments instruct wiring counts from the clean run's
+  `data/dq/report.json` (`rows_checked` per file), and `min`/`max` exist for
+  tolerant setups.
+- `pk_union`'s entity-level result introduces a synthetic file label
+  `(cross-file union)` in reports and logs; per-file row totals are unaffected.
+- Adding an 8th check type (or Parquet in 7c) follows this ADR pattern:
+  new numbered ADR, config-driven opt-in/opt-out, fail-fast validation.

@@ -1,24 +1,33 @@
-"""DQ runner (Milestone 7a, ADR-025).
+"""DQ runner (Milestones 7a + 7b, ADR-025/026).
 
 Wires config -> checks -> report over one output tree.
 
 Pipeline position (consumer side):
 
-    data/generated/  or  data/quality/
-            │
-            ▼
+    data/generated/  or  data/corrupted/
+            |
+            v
     DqRunner (--config configs/dq_base.yaml)
-            │   glob entity files, load parent key sets,
-            │   stream rows through the fixed 7a check suite
-            ▼
+            |   glob entity files, load parent key sets,
+            |   stream rows through the 7a+7b check suite:
+            |   not_null, fk_integrity, value_in_range, pk_unique,
+            |   duplicate_rows, row_count, pk_union (opt-in, cross-file)
+            v
     DqReport -> dq_report.json + [DQ] log lines + exit code
 
-Modes (the acceptance drill from docs/impurity_guide.md §11, automated):
+Modes (the acceptance drill from docs/impurity_guide.md, automated):
   clean   -- ok iff ZERO violations anywhere (validate the baseline)
   corrupt -- ok iff AT LEAST ONE check fired (prove the dirt is detectable)
 
-7a deliberately does NOT touch the manifest, Parquet, row_count checks,
-full-row duplicate detection, or cross-window PK union -- those are 7b/7c.
+A check runs for an entity iff ALL of these hold (ADR-026):
+  1. its global toggle in dq.checks is enabled (default: enabled),
+  2. the entity config carries what the check needs (required/foreign_keys/
+     ranges/row_count/pk_union -- pk_unique and duplicate_rows need nothing
+     beyond primary_key),
+  3. the entity's optional 'checks:' whitelist (if given) contains it.
+
+7b deliberately does NOT touch Parquet input -- that is 7c, and it needs its
+own dependency ADR (the harness stays stdlib + PyYAML until then).
 """
 from __future__ import annotations
 
@@ -34,14 +43,26 @@ from src.core.dq.checks import (
     Check,
     CheckResult,
     DqConfigError,
+    DuplicateRowsCheck,
     FkIntegrityCheck,
     NotNullCheck,
+    PkUnionCheck,
     PkUniqueCheck,
+    RowCountCheck,
+    RowCountSpec,
     ValueInRangeCheck,
 )
 
 REPORT_VERSION = 1
-CHECK_NAMES = ("not_null", "fk_integrity", "value_in_range", "pk_unique")
+CHECK_NAMES = (
+    "not_null",
+    "fk_integrity",
+    "value_in_range",
+    "pk_unique",
+    "duplicate_rows",
+    "row_count",
+    "pk_union",
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +74,9 @@ class EntityDqSpec:
     required: tuple[str, ...]
     foreign_keys: Mapping[str, str]  # column -> parent entity
     ranges: Mapping[str, Mapping[str, object]]
+    row_count: RowCountSpec | None = None
+    pk_union: bool = False
+    checks_whitelist: tuple[str, ...] = ()  # empty = no per-entity restriction
 
 
 @dataclass(frozen=True)
@@ -87,12 +111,26 @@ class DqConfig:
             if not isinstance(ranges_raw, Mapping):
                 raise DqConfigError(f"{entity}: ranges must be a mapping")
             ranges = {str(c): dict(r) for c, r in ranges_raw.items()}  # type: ignore[arg-type]
+            row_count_raw = spec_raw.get("row_count", None)
+            row_count = (
+                RowCountSpec.parse(str(entity), row_count_raw)
+                if row_count_raw is not None
+                else None
+            )
+            pk_union_raw = spec_raw.get("pk_union", False)
+            if not isinstance(pk_union_raw, bool):
+                raise DqConfigError(f"{entity}: pk_union must be true or false")
+            whitelist_raw = spec_raw.get("checks", None)
+            whitelist = DqConfig._parse_whitelist(str(entity), whitelist_raw)
             entities[str(entity)] = EntityDqSpec(
                 entity=str(entity),
                 primary_key=primary_key,
                 required=required,
                 foreign_keys=foreign_keys,
                 ranges=ranges,
+                row_count=row_count,
+                pk_union=bool(pk_union_raw),
+                checks_whitelist=whitelist,
             )
 
         raw_checks = dq.get("checks", {})
@@ -100,7 +138,10 @@ class DqConfig:
             raise DqConfigError("dq.checks must be a mapping of check toggles")
         unknown = sorted(set(raw_checks) - set(CHECK_NAMES))
         if unknown:
-            raise DqConfigError(f"unknown check name(s) in dq.checks: {unknown}")
+            raise DqConfigError(
+                f"unknown check name(s) in dq.checks: {unknown}; "
+                f"known checks: {', '.join(CHECK_NAMES)}"
+            )
         enabled = {
             name: bool((raw_checks.get(name) or {}).get("enabled", True))
             for name in CHECK_NAMES
@@ -109,19 +150,59 @@ class DqConfig:
             raise DqConfigError("all checks are disabled -- nothing to do")
         return DqConfig(entities=entities, enabled=enabled)
 
+    @staticmethod
+    def _parse_whitelist(entity: str, raw: object) -> tuple[str, ...]:
+        """Per-entity 'checks: [name, ...]' gate; absent = run everything."""
+        if raw is None:
+            return ()
+        if isinstance(raw, str) or not isinstance(raw, (list, tuple)):
+            raise DqConfigError(
+                f"{entity}: checks whitelist must be a list of check names"
+            )
+        names = tuple(str(n) for n in raw)
+        if not names:
+            raise DqConfigError(
+                f"{entity}: checks whitelist is empty -- remove the key to run all checks"
+            )
+        unknown = sorted(set(names) - set(CHECK_NAMES))
+        if unknown:
+            raise DqConfigError(
+                f"{entity}: unknown check name(s) in checks whitelist: {unknown}; "
+                f"known checks: {', '.join(CHECK_NAMES)}"
+            )
+        return names
+
+    def _allows(self, spec: EntityDqSpec, name: str) -> bool:
+        """The 3-part gate: global toggle AND config presence AND whitelist.
+
+        Config presence is checked by the caller (build_checks); the whitelist
+        part lives here so every check goes through the same funnel.
+        """
+        if not self.enabled[name]:
+            return False
+        return not spec.checks_whitelist or name in spec.checks_whitelist
+
     def build_checks(
         self, spec: EntityDqSpec, parent_keys: Mapping[str, frozenset[str]]
     ) -> list[Check]:
-        """Instantiate the enabled checks for one entity (fixed 7a order)."""
+        """Instantiate the enabled checks for one entity (fixed 7a+7b order).
+
+        pk_union is NOT built here: it is an entity-level pass the runner
+        drives after all files are processed (its state spans files).
+        """
         checks: list[Check] = []
-        if self.enabled["not_null"] and spec.required:
+        if self._allows(spec, "not_null") and spec.required:
             checks.append(NotNullCheck(spec.entity, spec.required))
-        if self.enabled["fk_integrity"] and spec.foreign_keys:
+        if self._allows(spec, "fk_integrity") and spec.foreign_keys:
             checks.append(FkIntegrityCheck(spec.entity, spec.foreign_keys, parent_keys))
-        if self.enabled["value_in_range"] and spec.ranges:
+        if self._allows(spec, "value_in_range") and spec.ranges:
             checks.append(ValueInRangeCheck(spec.entity, spec.ranges))
-        if self.enabled["pk_unique"]:
+        if self._allows(spec, "pk_unique"):
             checks.append(PkUniqueCheck(spec.entity, spec.primary_key))
+        if self._allows(spec, "duplicate_rows"):
+            checks.append(DuplicateRowsCheck(spec.entity))
+        if self._allows(spec, "row_count") and spec.row_count is not None:
+            checks.append(RowCountCheck(spec.entity, spec.row_count))
         return checks
 
 
@@ -225,6 +306,17 @@ class DqRunner:
     def _file_label(self, path: Path) -> str:
         return path.relative_to(self.tree).as_posix()
 
+    # -- header reading ----------------------------------------------------
+
+    def _read_header(self, path: Path) -> list[str]:
+        """First CSV line of a file as a column list (BOM-tolerant)."""
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            first_line = handle.readline()
+        header = next(csv.reader([first_line]), [])
+        if header and header[0].startswith("\ufeff"):
+            header[0] = header[0].lstrip("\ufeff")
+        return header
+
     # -- context -----------------------------------------------------------
 
     def load_parent_keys(self, parents: Iterable[str]) -> dict[str, frozenset[str]]:
@@ -259,11 +351,7 @@ class DqRunner:
         load_parent_keys). One header read per entity at startup makes any
         config/schema mismatch a guided one-line fix.
         """
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            first_line = handle.readline()
-        header = next(csv.reader([first_line]), [])
-        if header and header[0].startswith("\ufeff"):
-            header[0] = header[0].lstrip("\ufeff")
+        header = self._read_header(path)
         missing: list[str] = []
         if spec.primary_key not in header:
             missing.append(f"primary_key={spec.primary_key!r}")
@@ -295,24 +383,29 @@ class DqRunner:
         }
         parent_keys = self.load_parent_keys(sorted(parents_needed))
 
+        # Row accounting is taken from the files actually READ -- independent
+        # of which checks ran. Gating checks off per entity must not change
+        # what the report says about the tree's size (ADR-026).
+        file_rows: dict[str, int] = {}
         for entity, spec in self.config.entities.items():
             checks = self.config.build_checks(spec, parent_keys)
             files = self.entity_files(entity)
             self._validate_header(entity, spec, files[0])
             self.log("DQ", f"{entity}: {len(files)} file(s), checks={[c.name for c in checks]}")
             for path in files:
-                results.extend(self._check_file(path, entity, checks))
+                outcomes, n_rows = self._check_file(path, entity, checks)
+                results.extend(outcomes)
+                file_rows[self._file_label(path)] = n_rows
+            results.extend(self._pk_union_results(entity, spec, files))
 
         violations_total = sum(r.violation_count for r in results)
-        # Every check over the same file reports the same rows_checked; count
-        # each FILE once, not once per check.
-        rows_checked = sum({r.file: r.rows_checked for r in results}.values())
+        rows_checked = sum(file_rows.values())
         ok = self._evaluate(results)
         report = DqReport(
             tree=self.tree.as_posix(),
             mode=self.mode,
             ok=ok,
-            files_checked=len({r.file for r in results}),
+            files_checked=len(file_rows),
             rows_checked=rows_checked,
             violations_total=violations_total,
             results=tuple(results),
@@ -324,7 +417,7 @@ class DqRunner:
         )
         return report
 
-    def _check_file(self, path: Path, entity: str, checks: list[Check]) -> list[CheckResult]:
+    def _check_file(self, path: Path, entity: str, checks: list[Check]) -> tuple[list[CheckResult], int]:
         spec = self.config.entities[entity]
         label = self._file_label(path)
         outcomes: list[CheckResult] = []
@@ -337,7 +430,51 @@ class DqRunner:
             result = check.run(label, iter(rows))
             outcomes.append(result)
             self._log_result(result, spec.primary_key)
-        return outcomes
+        return outcomes, len(rows)
+
+    # -- pk_union (entity-level, cross-file) ---------------------------------
+
+    def _pk_union_results(self, entity: str, spec: EntityDqSpec, files: list[Path]) -> list[CheckResult]:
+        """Opt-in cross-window PK union over ALL files of one entity."""
+        if not self.config.enabled["pk_union"] or not spec.pk_union:
+            return []
+        if len(files) < 2:
+            self.log(
+                "DQ",
+                f"{entity}: pk_union skipped (needs >= 2 files/windows, found {len(files)})",
+            )
+            return []
+        for path in files:
+            header = self._read_header(path)
+            if spec.primary_key not in header:
+                raise DqConfigError(
+                    f"{entity}: pk_union: configured column {spec.primary_key!r} "
+                    f"not in CSV header of {self._file_label(path)}; "
+                    f"actual header: {header}; "
+                    "-> fix dq.entities in the DQ config to match the real column names"
+                )
+        check = PkUnionCheck(entity, spec.primary_key)
+        file_pks = {
+            self._file_label(path): self._stream_pk_column(path, spec.primary_key)
+            for path in files
+        }
+        result = check.run_over_files(file_pks)
+        self._log_result(result, spec.primary_key)
+        return [result]
+
+    def _stream_pk_column(self, path: Path, pk: str) -> Iterator[str]:
+        """Stream just the PK column of one file (second pass, column-only)."""
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, [])
+            if header and header[0].startswith("\ufeff"):
+                header[0] = header[0].lstrip("\ufeff")
+            index = header.index(pk)  # _pk_union_results validated presence
+            for fields in reader:
+                if len(fields) > index:
+                    yield fields[index]
+
+    # -- reporting -----------------------------------------------------------
 
     def _log_result(self, result: CheckResult, primary_key: str) -> None:
         sample = ""
