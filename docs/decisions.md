@@ -344,3 +344,96 @@ one-line census command before any drill runs.
   run, completing the harness's evidence chain against the impurity suite.
 - Adding the two unseen entities (and `product`) follows the same shape:
   primary_key + required + row_count from the report, then FK wiring.
+---
+
+## ADR-028 — DQ harness 7d: Parquet input — reader dependency and row normalization
+
+**Status:** Accepted (Milestone 7d — ADR-only; zero code, config, or test changes)
+
+**Context.** The harness is an output-tree consumer (ADR-025): it reads
+whatever `--tree` points at, plus `configs/dq_base.yaml`. Every tree it has
+consumed so far is CSV because the engine writes CSV — but that is the
+writer's current choice, not the consumer's contract. Downstream pipelines
+exchange data as Parquet far more often than as CSV (columnar, typed,
+compressed; the de-facto interchange format of analytics storage), and a
+consumer template that can only read CSV models the rare case. The charter
+forbids new dependencies without an ADR; ADR-026 deferred Parquet behind
+exactly such an ADR, and ADR-027 re-slotted it here after 7c consumed the
+wiring milestone. The real design questions are therefore: which reader
+dependency, how typed Parquet cells meet a deliberately stringly-typed check
+pipeline, and what stays out of scope.
+
+**Decision.**
+1. **Format flexibility is a reader concern, not a writer one.** The harness
+   accepts MIXED trees: `.csv` and `.parquet` side by side under the same
+   entity directories, the per-file format selected by extension alone,
+   using the same stem-discovery rules as today (ADR-025 v2.1
+   partition-first fallback, prefix-collision guard included). The engine
+   and its output layout are untouched; generator-side Parquet output is a
+   non-goal of this ADR.
+2. **One new dependency: pyarrow, lazy-imported.** `pyarrow.parquet` is
+   imported only when a discovered file actually needs reading. CSV-only
+   runs never import it: behavior, startup, and bytes are unchanged. If a
+   Parquet file is discovered and the import fails, the run fail-fasts with
+   a one-line diagnostic (`pyarrow is required for Parquet input: pip
+   install pyarrow`) — loud, never silent. Documented floor: pyarrow >= 14;
+   no version pin in code.
+3. **Reader-boundary normalization is the load-bearing decision.** Every
+   Parquet cell is converted to `str` and every null to `""` before any
+   check sees it: int -> str(int); float -> repr(float) (shortest
+   round-trip form, deterministic since Python 3.1); bool -> "true"/"false";
+   date/timestamp -> ISO-8601 string; decimal -> str(decimal). Binary,
+   list, struct, and map columns fail fast with a diagnostic (out of
+   scope). This keeps checks.py, the runner's accounting, the report JSON
+   (`REPORT_VERSION` stays 1), and all 103 tests format-blind. None is
+   indistinguishable from a CSV empty cell by design, which preserves Law 2
+   (empty FK cells skipped) and not_null's blank semantics exactly; a full
+   row survives as the same string tuple the CSV path produces, so
+   `duplicate_rows` and the pk checks compare identically across formats.
+4. **Header validation parity.** `_validate_header()` validates against the
+   Parquet schema's field names exactly as it does against CSV headers (no
+   BOM concept exists); a mismatch fail-fasts printing the actual schema
+   names, same message shape as the CSV path. Parquet's real types remove
+   the encoding class of bugs the CSV path carries (UTF-8-sig, quoting).
+5. **No config schema change — now or in the implementation milestone.**
+   File extension is the single format selector; a `format:` override key
+   is rejected as speculative config. dq_base.yaml keeps saying WHAT to
+   check, never HOW files are parsed.
+6. **The implementation milestone (7e) is pre-registered here.** Scope: the
+   runner's read-path extension; Parquet unit tests built with pyarrow
+   inside the test suite under `pytest.importorskip("pyarrow")` so
+   dependency-free environments still run the 103; e2e CHECK: a
+   mixed-format tree passes the clean drill at 0 violations, and a
+   corruption planted in the Parquet entity fires the same check names.
+   Nothing in 7d changes behavior, so no drills accompany this milestone.
+
+**Alternatives considered.**
+- pandas (`pd.read_parquet`): drags numpy plus transitive dependencies in
+  for one function; a second data abstraction the harness does not need.
+  Rejected.
+- polars: same class of concern; less ubiquitous here than pyarrow, which
+  is also the canonical library if the engine ever writes Parquet.
+  Rejected.
+- duckdb with checks as SQL: a paradigm shift that touches every check and
+  the report at once. Rejected as scope creep.
+- Stay CSV-only: leaves the consumer template blind to the most common
+  downstream interchange format. Rejected (contradicts ADR-025's purpose).
+- Wait until the writer emits Parquet: couples the consumer's contract to
+  the writer's current serialization choice — exactly backwards. Rejected.
+
+**Consequences.**
+- One optional dependency, absent until a Parquet file demands it; CSV
+  deployments never notice it exists.
+- The conversion table in decision 3 is now contract: 7e test-pins it
+  (ints exact; floats round-trip via repr deterministically across
+  platforms; nulls indistinguishable from CSV empties by design).
+- Violation samples from Parquet files print normalized strings (e.g.,
+  quantity -3 renders as "-3"); report shape and the exit-code contract
+  are unchanged.
+- Manifest v3 sha256 stays format-blind (hashes bytes); the report's
+  rows_checked counts Parquet files exactly like CSV files.
+- Rollback is trivial: stop pointing trees at Parquet. The CSV path is
+  untouched except the shared discovery regex.
+- datasets=8 (two unseen entities), `order_item.product_id -> product`,
+  and the engine-vs-harness FK reconciliation remain separate backlog
+  items, unaffected by this ADR.
