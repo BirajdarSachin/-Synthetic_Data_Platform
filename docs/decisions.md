@@ -275,3 +275,72 @@ when 7a shipped.
   `(cross-file union)` in reports and logs; per-file row totals are unaffected.
 - Adding an 8th check type (or Parquet in 7c) follows this ADR pattern:
   new numbered ADR, config-driven opt-in/opt-out, fail-fast validation.
+---
+
+## ADR-027 — DQ harness 7c: expectation wiring from accepted drill evidence
+
+**Status:** Accepted (Milestone 7c — config-only; no harness code changes)
+
+**Context.** The 7b drill went green on the real machine (103 tests; clean
+tree 0 violations / 23020 rows; corrupted tree 732 violations / 23376 rows,
+exit 0 both). That run closed the code backlog but left three checks without
+live proof on real dirt (`not_null` and `value_in_range` never fired; only
+`customer` had a `row_count` expectation), and the drill evidence itself
+carried the missing facts: the `duplicate_rows` sample lines print full rows,
+which leaked the real headers of `order` (`customer_id`, `order_date`,
+`order_id`, `sales_rep_employee_id`, `status`) and `order_item` (`order_id`,
+`order_item_id`, `product_id`, `quantity`, `unit_price`); the accepted clean
+run pinned the per-file row counts; the impurity guide (§6.3) pins
+`quantity`'s declared domain at 1..100. The one remaining unknown — WHICH
+`order` column the engine's null rule blanks (57 rows) — is resolvable with a
+one-line census command before any drill runs.
+
+**Decision.**
+1. **`row_count` is wired for all six entities** (`expected:` 1000 / 5000 /
+   12000 / 20 / 2000 / 3000, taken verbatim from the accepted clean drill's
+   `rows_checked`). Row counts become a contract: any regenerated volume
+   change fails loudly, and the fix is re-wiring from `data/dq/report.json`.
+   This is the coupling ADR-026's consequences section anticipated; it is now
+   deliberate.
+2. **`order_item.ranges.quantity = {min: 1, max: 100, type: int}`** mirrors
+   the engine's declared domain for `quantity` (impurity guide §6.3), so the
+   65 `out_of_range` rows on `data/corrupted` become visible to
+   `value_in_range` — its first live proof.
+3. **`order.required = [order_id, status]` is PROVISIONAL.** `status` is the
+   most likely null-rule target among the five real `order` columns (the
+   guide's null rationale is "optional string field at the source";
+   `customer_id` is taken by `invalid_fk`, `order_id` is the key). The
+   confirmation protocol is a census one-liner counting empty cells per
+   column on the corrupted `order` file; if it names a different column, the
+   fix is one line in this config. A wrong guess cannot break either drill:
+   clean data is complete by construction, and the corrupt contract only
+   needs >= 1 fired check.
+4. **`order.foreign_keys += sales_rep_employee_id -> employee`.** Second real
+   FK, column proven by drill evidence (`sales_rep_employee_id=10`); the
+   parent `employee` is already configured with a header-validated
+   `employee_id`. Empty FK cells stay `fk_integrity`-skipped (Law 2), so the
+   check is safe even if the generator leaves some sales reps unset.
+5. **`order_item.product_id -> product` stays UNWIRED.** `product` has no
+   `dq.entities` entry (the log's `datasets=8` vs 6 configured entities), and
+   the runner fail-fasts on FK parents it cannot load (ADR-025 header
+   discipline). Wire the missing entities first, then this FK.
+6. **No new check, no code change, `REPORT_VERSION` unchanged.** ADR-026
+   pointed Parquet input at 7c; this wiring milestone consumed the 7c slot,
+   so Parquet slides to 7d and still needs its reader-dependency ADR.
+
+**Consequences.**
+- The clean drill must stay at exactly 0 violations / 23020 rows: every wired
+  expectation mirrors generator output by construction, so any clean-tree
+  failure now indicates a real change in the generator, not harness noise.
+- The corrupted drill is expected to rise from 732 to ~856 violations:
+  +57 `not_null` (if `status` is the null column), +65 `value_in_range`,
+  +2 `row_count` (order 5110 != 5000, order_item 12223 != 12000). If the
+  census names a different null column, the floor is 799 until the one-line
+  swap lands. The corrupt contract (ok iff >= 1 check fired) holds either
+  way. Counts may drift a few above these numbers if the engine's duplicate
+  rule copied already-corrupted rows (copies of dirty rows are equally dirty
+  and each counts once).
+- All four 7a checks now have live proof on real dirt after the next corrupt
+  run, completing the harness's evidence chain against the impurity suite.
+- Adding the two unseen entities (and `product`) follows the same shape:
+  primary_key + required + row_count from the report, then FK wiring.

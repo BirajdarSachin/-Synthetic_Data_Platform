@@ -1,28 +1,35 @@
 # =============================================================================
-# dq_base.yaml -- DQ check configuration (Milestone 7b, v4 -- ADR-025/026)
+# dq_base.yaml -- DQ check configuration (Milestone 7c, v5 -- ADR-025/026/027)
 #
-# v4 adds three checks to the 7a suite (all default-enabled when absent from
-# dq.checks, so upgrading needs NO config edits):
-#   duplicate_rows -- exact full-row copies within one file. The impurity
-#                     engine's duplicate rule makes exact copies, so this
-#                     fires on data/corrupted alongside pk_unique with zero
-#                     extra config (one violation per extra copy).
-#   row_count      -- per-file size expectation: 'expected: N' (exact) or
-#                     'min'/'max' bounds. customer is wired below from the
-#                     accepted 7a drill (1000 clean rows; the corrupted tree
-#                     holds 1023, so this check now fires there too). Wire
-#                     the rest from the clean run's data/dq/report.json
-#                     (rows_checked per file).
-#   pk_union       -- OPT-IN per entity ('pk_union: true'): a primary key
-#                     must not appear in MORE THAN ONE file/window. Off by
-#                     default because SCD-style snapshots legitimately repeat
-#                     keys across reference_date windows. Needs >= 2 files.
-# Per-entity gate: add 'checks: [name, ...]' to an entity to run ONLY those
-# checks for it (unknown names are a startup error). A check runs iff its
-# global toggle is enabled AND the entity config provides what it needs AND
-# (no whitelist or the whitelist contains it).
-# Parquet input is deferred to 7c -- it needs a reader-dependency decision;
-# the harness stays stdlib + PyYAML until that ADR lands.
+# v5 is the WIRING milestone (ADR-027): zero code changes -- every new line is
+# an expectation harvested from accepted drill evidence.
+#
+#   * row_count wired for ALL SIX entities. The accepted 7b clean drill pinned
+#     the per-file volumes (customer 1000, order 5000, order_item 12000,
+#     employee 20, review 2000, payment 3000); they are a contract now. If you
+#     regenerate with different volumes, re-wire from data/dq/report.json
+#     (rows_checked per file) -- the check fails loudly by design.
+#   * order_item.ranges.quantity {min 1, max 100, type int} -- the engine's
+#     declared domain for quantity (impurity guide section 6.3). This unmasks
+#     the 65 out_of_range rows on data/corrupted (value_in_range's first live
+#     proof on real dirt).
+#   * order.required grows to [order_id, status] -- PROVISIONAL null-column
+#     wiring (ADR-027 decision 3). The engine's null rule blanks one order
+#     column (57 rows); status is the most likely target among the five real
+#     columns (customer_id/order_date/order_id/sales_rep_employee_id/status,
+#     all confirmed by the 7b evidence lines). Confirm with the census
+#     one-liner printed by the bootstrap SUMMARY; if it names a different
+#     column, swap it into required (one line, then re-run the drills).
+#   * order.foreign_keys += sales_rep_employee_id -> employee -- the second
+#     real FK, column proven by the 7b evidence line sales_rep_employee_id=10.
+#     Empty cells stay skipped by fk_integrity (Law 2), so this is safe even
+#     if the generator leaves some sales reps unset.
+#   * order_item.product_id -> product stays UNWIRED: product has no
+#     dq.entities entry yet (datasets=8 vs 6 configured) and the runner
+#     fail-fasts on FK parents it cannot load. Wire both together later.
+#
+# ADR-026 pointed Parquet at 7c; this wiring milestone consumed the 7c slot,
+# so Parquet input slides to 7d (still needs its reader-dependency ADR).
 #
 # Drills on this machine (quality root is data/corrupted per your [WRITER] log):
 #   clean    .venv\Scripts\python.exe dq_main.py --tree data\generated  --mode clean
@@ -50,45 +57,46 @@ dq:
       enabled: true          # cross-window PK union where opted in (7b)
 
   entities:
-    # --- customer: confirmed by the accepted 7a drill (1000 clean rows;
-    # 1023 in data/corrupted -> pk_unique fired 23).
+    # --- volumes below are the accepted 7b clean drill's rows_checked.
     customer:
       primary_key: customer_id
       required: [customer_id]
-      row_count: {expected: 1000}   # 7b: fires on data/corrupted (1023 != 1000)
+      row_count: {expected: 1000}
 
     order:
       primary_key: order_id
-      required: [order_id]
+      required: [order_id, status]   # status: provisional null-column wiring -- confirm with the census one-liner
       foreign_keys:
-        customer_id: customer   # TODO verify column + parent against the real header
-      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+        customer_id: customer
+        sales_rep_employee_id: employee   # 7c: second real FK (proven by drill evidence)
+      row_count: {expected: 5000}
       # pk_union: true               # only if keys must be unique ACROSS windows
 
     order_item:
       primary_key: order_item_id
       required: [order_item_id]
-      # out_of_range fired on this entity (65 rows) -- wire the real column and
-      # business range once confirmed from the header, e.g.:
-      # ranges:
-      #   quantity: {min: 1, max: 100, type: int}
-      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+      ranges:
+        quantity: {min: 1, max: 100, type: int}   # 7c: engine domain (guide section 6.3)
+      row_count: {expected: 12000}
+      # product_id -> product: parent entity not configured yet (datasets=8);
+      # add the product entity to dq.entities first, then wire the FK here.
 
     employee:
       primary_key: employee_id
       required: [employee_id]
-      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+      row_count: {expected: 20}
 
     review:
       primary_key: review_id
       required: [review_id]
-      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+      row_count: {expected: 2000}
 
     payment:
       primary_key: payment_id
       required: [payment_id]
-      # row_count: {expected: ...}   # wire from data/dq/report.json rows_checked
+      row_count: {expected: 3000}
 
-    # --- datasets=8 in your log: add the remaining entities here, same shape.
-    # Null rule fired on order (57 rows): once you know WHICH column was
-    # nulled, add it to that entity's required list so not_null catches it.
+    # --- datasets=8: two entity directories are still unseen. When a drill
+    # errors, the diagnostic prints the tree contents -- add the missing
+    # entities here (same shape: primary_key + required + row_count from
+    # data/dq/report.json), then wire order_item.product_id -> product.
