@@ -1,0 +1,323 @@
+"""Integration tests for the DQ runner and config (Milestone 7a, ADR-025).
+
+Builds tiny synthetic output trees (customers + orders, snapshot layout) in
+tmp_path and runs DqRunner end-to-end in both modes:
+  clean   tree  -> ok=True
+  corrupt tree  -> ok=False in clean mode, ok=True in corrupt mode
+Mirrors docs/impurity_guide.md section 11 (the acceptance drill) at unit scale.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import pytest
+import yaml
+
+from src.core.dq.checks import DqConfigError
+from src.core.dq.runner import DqConfig, DqRunner, write_report
+
+DATE = "2026-10-24"
+
+
+def make_tree(root: Path, orders_rows: list[dict], customers_rows: list[dict] | None = None):
+    """Lay out a snapshot tree: {entity}/reference_date={date}/{entity}_{date}.csv"""
+    if customers_rows is None:
+        customers_rows = [{"customer_id": str(i), "name": f"c{i}", "registration_date": DATE}
+                          for i in range(1, 4)]
+    for entity, rows_data in (("customers", customers_rows), ("orders", orders_rows)):
+        folder = root / entity / f"reference_date={DATE}"
+        folder.mkdir(parents=True, exist_ok=True)
+        header = list(rows_data[0].keys())
+        lines = [",".join(header)]
+        lines += [",".join(str(row[c]) for c in header) for row in rows_data]
+        (folder / f"{entity}_{DATE}.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return root
+
+
+def base_config() -> dict:
+    return {
+        "dq": {
+            "entities": {
+                "customers": {
+                    "primary_key": "customer_id",
+                    "required": ["customer_id", "name"],
+                },
+                "orders": {
+                    "primary_key": "order_id",
+                    "required": ["order_id", "customer_id", "total_amount"],
+                    "foreign_keys": {"customer_id": "customers"},
+                    "ranges": {"quantity": {"min": 1, "max": 100, "type": "int"}},
+                },
+            }
+        }
+    }
+
+
+def quiet_runner(tree: Path, config: DqConfig, mode: str) -> DqRunner:
+    return DqRunner(tree, config, mode, log=lambda tag, msg: None)
+
+
+def clean_orders() -> list[dict]:
+    return [
+        {"order_id": str(i), "customer_id": "1", "order_date": DATE,
+         "total_amount": f"{10 * i}.50", "quantity": str(i)}
+        for i in range(1, 6)
+    ]
+
+
+# ------------------------------------------------------------------ config
+
+
+class TestDqConfig:
+    def test_loads_valid_config(self):
+        config = DqConfig.load(base_config())
+        assert set(config.entities) == {"customers", "orders"}
+        assert all(config.enabled.values())  # absent toggles default to enabled
+
+    def test_missing_dq_block_is_config_error(self):
+        with pytest.raises(DqConfigError, match="'dq:'"):
+            DqConfig.load({})
+
+    def test_no_entities_is_config_error(self):
+        with pytest.raises(DqConfigError, match="entities"):
+            DqConfig.load({"dq": {"entities": {}}})
+
+    def test_missing_primary_key_is_config_error(self):
+        raw = {"dq": {"entities": {"orders": {"required": ["a"]}}}}
+        with pytest.raises(DqConfigError, match="primary_key"):
+            DqConfig.load(raw)
+
+    def test_unknown_check_toggle_is_config_error(self):
+        raw = base_config()
+        raw["dq"]["checks"] = {"not_a_check": {"enabled": True}}
+        with pytest.raises(DqConfigError, match="unknown check"):
+            DqConfig.load(raw)
+
+    def test_all_disabled_is_config_error(self):
+        raw = base_config()
+        raw["dq"]["checks"] = {
+            name: {"enabled": False}
+            for name in ("not_null", "fk_integrity", "value_in_range", "pk_unique")
+        }
+        with pytest.raises(DqConfigError, match="all checks are disabled"):
+            DqConfig.load(raw)
+
+    def test_yaml_roundtrip(self):
+        config = DqConfig.load(yaml.safe_load(yaml.safe_dump(base_config())))
+        assert config.entities["orders"].primary_key == "order_id"
+
+
+# ------------------------------------------------------------------ runner
+
+
+class TestRunnerCleanTree:
+    def test_clean_tree_passes_in_clean_mode(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "clean").run()
+        assert report.ok is True
+        assert report.violations_total == 0
+        assert report.files_checked == 2
+        assert report.rows_checked == 8  # 3 customers + 5 orders
+
+    def test_clean_tree_fails_corrupt_expectation(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "corrupt").run()
+        assert report.ok is False  # no dirt found, but dirt was required
+
+
+class TestRunnerCorruptTree:
+    def corrupt_orders(self) -> list[dict]:
+        rows_data = clean_orders()
+        rows_data[1]["customer_id"] = "999"         # invalid_fk: reserved band > parent max
+        rows_data[2]["quantity"] = "-3"             # out_of_range
+        rows_data.append(dict(rows_data[3]))        # duplicate: exact copy incl. PK
+        return rows_data
+
+    def test_corrupt_tree_caught_in_clean_mode(self, tmp_path):
+        tree = make_tree(tmp_path, self.corrupt_orders())
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "clean").run()
+        assert report.ok is False
+        fired = {r.check for r in report.results if not r.passed}
+        assert fired == {"fk_integrity", "value_in_range", "pk_unique"}
+
+    def test_corrupt_tree_passes_in_corrupt_mode(self, tmp_path):
+        tree = make_tree(tmp_path, self.corrupt_orders())
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "corrupt").run()
+        assert report.ok is True
+
+    def test_each_rule_caught_individually(self, tmp_path):
+        """One corruption at a time -- each impurity rule has its own catcher."""
+        config = DqConfig.load(base_config())
+        cases = [
+            ("invalid_fk", lambda r: r.update(customer_id="999"), "fk_integrity"),
+            ("out_of_range", lambda r: r.update(quantity="0"), "value_in_range"),
+            ("duplicate", lambda r: None, "pk_unique"),  # handled below
+        ]
+        for name, mutate, expected_check in cases:
+            rows_data = clean_orders()
+            if name == "duplicate":
+                rows_data.append(dict(rows_data[0]))
+            else:
+                mutate(rows_data[0])
+            tree = make_tree(tmp_path / name, rows_data)
+            report = quiet_runner(tree, config, "clean").run()
+            fired = {r.check for r in report.results if not r.passed}
+            assert fired == {expected_check}, f"{name} should fire {expected_check} only"
+
+
+class TestDiscovery:
+    """File discovery must be layout-tolerant AND self-diagnosing when empty."""
+
+    def test_empty_tree_diagnostic_shows_contents(self, tmp_path):
+        config = DqConfig.load(base_config())
+        with pytest.raises(DqConfigError) as excinfo:
+            quiet_runner(tmp_path, config, "clean").run()
+        msg = str(excinfo.value)
+        assert "no CSV files found for entity 'customers'" in msg
+        assert "(tree exists but is EMPTY)" in msg
+        assert "generate the data first" in msg
+
+    def test_wrong_entity_name_diagnostic_lists_actual_dirs(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        raw = base_config()
+        raw["dq"]["entities"]["ghosts"] = {"primary_key": "ghost_id"}
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError) as excinfo:
+            quiet_runner(tree, config, "clean").run()
+        msg = str(excinfo.value)
+        assert "no CSV files found for entity 'ghosts'" in msg
+        assert "customers/" in msg and "orders/" in msg  # the actual tree contents
+
+    def test_partition_first_layout_found_by_stem(self, tmp_path):
+        """No entity dirs at all: {partition}/{entity}_{date}.csv must be found."""
+        folder = tmp_path / f"reference_date={DATE}"
+        folder.mkdir()
+        customers = [{"customer_id": "1", "name": "c1", "registration_date": DATE}]
+        header = ",".join(customers[0])
+        (folder / f"customers_{DATE}.csv").write_text(
+            header + "\n" + ",".join(customers[0].values()) + "\n", encoding="utf-8"
+        )
+        header_o = ",".join(clean_orders()[0])
+        rows_o = "\n".join(",".join(r.values()) for r in clean_orders())
+        (folder / f"orders_{DATE}.csv").write_text(
+            header_o + "\n" + rows_o + "\n", encoding="utf-8"
+        )
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tmp_path, config, "clean").run()
+        assert report.ok is True
+        assert report.files_checked == 2
+
+    def test_prefix_collision_guarded(self, tmp_path):
+        """Entity 'orders' must NOT sweep in order_items_*.csv (digit guard)."""
+        folder = tmp_path / f"reference_date={DATE}"
+        folder.mkdir()
+        (folder / f"order_items_{DATE}.csv").write_text(
+            "order_item_id,order_id\n1,1\n", encoding="utf-8"
+        )
+        raw = {"dq": {"entities": {"orders": {"primary_key": "order_id",
+                                             "required": ["order_id"]}}}}
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError, match="no CSV files found for entity 'orders'"):
+            quiet_runner(tmp_path, config, "clean").run()
+
+    def test_entity_dir_takes_precedence_over_stray_stem(self, tmp_path):
+        """If {tree}/{entity}/ exists and has CSVs, strays elsewhere are ignored."""
+        tree = make_tree(tmp_path, clean_orders())
+        archive = tree / "archive"
+        archive.mkdir()
+        (archive / "customers_2020-01-01.csv").write_text(
+            "customer_id,name\n9,old\n", encoding="utf-8"
+        )
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "clean").run()
+        assert report.ok is True
+        assert report.files_checked == 2  # archive strays not swept in
+
+
+class TestHeaderValidation:
+    """Every configured column must exist in the real CSV header (fail-fast).
+
+    A wrong parent pk must raise at load_parent_keys time -- silently loading
+    an empty key set would flag every FK row as a violation instead.
+    """
+
+    def test_wrong_pk_prints_actual_header(self, tmp_path):
+        # raises inside load_parent_keys: orders' FK points at customers,
+        # whose (wrong) pk is validated before any key is loaded
+        tree = make_tree(tmp_path, clean_orders())
+        raw = base_config()
+        raw["dq"]["entities"]["customers"]["primary_key"] = "cust_id"
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError) as excinfo:
+            quiet_runner(tree, config, "clean").run()
+        msg = str(excinfo.value)
+        assert "customers" in msg
+        assert "actual header" in msg
+        assert "primary_key='cust_id'" in msg   # the wrong config column...
+        assert "customer_id" in msg             # ...and the real header printed
+
+    def test_wrong_required_column_caught(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        raw = base_config()
+        raw["dq"]["entities"]["orders"]["required"] = ["order_id", "amount"]
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError, match="required='amount'"):
+            quiet_runner(tree, config, "clean").run()
+
+    def test_wrong_fk_column_caught(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        raw = base_config()
+        raw["dq"]["entities"]["orders"]["foreign_keys"] = {"cust_id": "customers"}
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError, match="foreign_keys='cust_id'"):
+            quiet_runner(tree, config, "clean").run()
+
+    def test_wrong_range_column_caught(self, tmp_path):
+        tree = make_tree(tmp_path, clean_orders())
+        raw = base_config()
+        raw["dq"]["entities"]["orders"]["ranges"] = {"qty": {"min": 1, "max": 5, "type": "int"}}
+        config = DqConfig.load(raw)
+        with pytest.raises(DqConfigError, match="ranges='qty'"):
+            quiet_runner(tree, config, "clean").run()
+
+
+class TestRunnerEdgeCases:
+    def test_missing_entity_is_config_error(self, tmp_path):
+        config = DqConfig.load(base_config())
+        with pytest.raises(DqConfigError, match="no CSV files found for entity 'customers'"):
+            quiet_runner(tmp_path, config, "clean").run()
+
+    def test_missing_tree_is_config_error(self, tmp_path):
+        config = DqConfig.load(base_config())
+        with pytest.raises(DqConfigError, match="output tree not found"):
+            quiet_runner(tmp_path / "nope", config, "clean")
+
+    def test_bad_mode_is_config_error(self, tmp_path):
+        config = DqConfig.load(base_config())
+        with pytest.raises(DqConfigError, match="mode"):
+            quiet_runner(tmp_path, config, "paranoid")
+
+    def test_fk_parent_without_dq_entry_is_config_error(self, tmp_path):
+        raw = base_config()
+        raw["dq"]["entities"]["orders"]["foreign_keys"] = {"customer_id": "ghosts"}
+        config = DqConfig.load(raw)
+        tree = make_tree(tmp_path, clean_orders())
+        with pytest.raises(DqConfigError, match="no dq.entities entry"):
+            quiet_runner(tree, config, "clean").run()
+
+    def test_report_written_atomically_and_parseable(self, tmp_path):
+        tree = make_tree(tmp_path / "tree", clean_orders())
+        config = DqConfig.load(base_config())
+        report = quiet_runner(tree, config, "clean").run()
+        target = tmp_path / "out" / "report.json"
+        write_report(report, target, log=lambda tag, msg: None)
+        assert not target.with_name("report.json.tmp").exists()  # tmp replaced away
+        loaded = __import__("json").loads(target.read_text(encoding="utf-8"))
+        assert loaded["ok"] is True
+        assert loaded["report_version"] == 1
+        assert loaded["results"][0]["file"].startswith("customers/")

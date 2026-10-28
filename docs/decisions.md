@@ -148,3 +148,53 @@ Alternatives: value * multiplier (rejected: overflow risks, less canonical);conf
 - Why: Bucketing over per-window independent generation keeps PKs globallysequential for free (union of window files is exactly 1..N - ADR-0001) andinherits cross-window temporal integrity from ADR-0016 rules(order_date >= registration_date implies the order's window >= thecustomer's registration window; same for payment/review), with zero newbusiness rules. The fact/dimension split mirrors real lakehouses:dimensions are snapshots, facts are event-date partitioned - which is thelayout Athena partition pruning requires (Project 1). Individual windowfiles contain a deterministic SUBSET of PKs (gaps are normal, exactly likereal incremental delta files). Per-window independent generation (seed perwindow without regenerating siblings) is deferred to Phase 7.
 - Alternatives: per-window independent generation with id offsets (rejectedfor now: complex offset math and per-window customer pools; revisited inPhase 7); one partition key name for both modes (rejected: a snapshot'skey IS the reference date, a fact window's key IS the event window - twosemantics, two honest names); keeping manifest v2 with one path perdataset (rejected: windowed entities have many files; versioned schemachange is the sanctioned mechanism - ADR-0007 thinking applied tometadata).
 - Impact: platform 1.1.0. Config gains optional generation.window; manifestreaders must handle v3 (versioned detection); _manifests/ locationunchanged (ADR-0011 clause still in force). Hourly/weekly granularity andper-window independent generation deferred (Phase 7); event_time vsingestion_time and late-arriving data remain Phase 6.
+# ADR text for docs/decisions.md (appended by bootstrap_milestone7a.py)
+
+---
+
+## ADR-025 — DQ harness is an output-tree consumer with a fixed 4-check suite
+
+**Status:** Accepted (Milestone 7a)
+
+**Context.** The platform now produces two output trees: the clean baseline
+(`data/generated`) and corrupted copies (`data/quality`, impurity engine,
+guides in `docs/impurity_guide.md`). Downstream Data Engineering projects need
+a repeatable way to prove two things: the baseline honors the platform's
+structural guarantees, and the corrupted tree's dirt is *detectable*. That is
+the acceptance drill from the operator guide (§11), currently run by hand.
+
+**Decision.**
+1. The DQ harness is a **consumer of output files only**. It reads CSV files
+   and a DQ config (`configs/dq_base.yaml`); it never imports generator,
+   writer, or impurity internals. It is shaped exactly like a downstream ETL
+   test suite, so it doubles as a template for future consumers.
+2. The 7a suite is fixed and mirrors the impurity chain:
+   `not_null -> fk_integrity -> value_in_range -> pk_unique`
+   (one check per corruption condition; duplicates and cross-window PK union
+   are deferred to 7b; Parquet support to 7b as well).
+3. **Two expectation modes** at the entry point `dq_main.py`:
+   `--mode clean` (ok iff zero violations) and `--mode corrupt` (ok iff at
+   least one check fires). Exit contract unchanged: 0 ok, 1 failure, 130 Ctrl+C.
+4. **New log tag `[DQ]`** joins the ADR-0009 tag set. Same `run()`-wrapper
+   structure, per-run console logging, atomic JSON report
+   (`data/dq/report.json` by default, `.tmp` + `os.replace`).
+5. Config keys default to *enabled* when a check toggle is absent; this is a
+   documented default (like `quality.output.root`), not hidden behaviour.
+   Unknown check names, unknown range keys, `min > max`, all-checks-disabled,
+   missing `primary_key`, missing tree/entity directories, and FK parents
+   without a `dq.entities` entry are all startup failures (exit 1).
+6. CSV null == empty string. Value-based checks skip empty cells; emptiness
+   is exclusively `not_null`'s concern — mirroring the impurity engine's Law 2
+   so the two sides of the platform reason about nulls identically.
+
+**Consequences.**
+- No coupling: DQ can evolve (and be copied into downstream projects) without
+  touching the generator core. Tests are pure-stdlib fixtures.
+- The check suite is a *contract*: adding a check type or changing semantics
+  changes reports and exit behaviour — future additions follow this ADR as a
+  new numbered ADR (instance vs new pattern test applies).
+- `[DQ]` lines are additive to the ADR-0009 log contract; existing tags and
+  exit codes are unchanged, so no §26 protocol is triggered.
+- Corrupted trees are *expected* to fail `--mode clean`; failing there is the
+  success signal. Tooling that consumes this harness must pass the mode
+  explicitly rather than assume one.

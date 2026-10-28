@@ -1,0 +1,66 @@
+# =============================================================================
+# dq_base.yaml -- DQ check configuration (Milestone 7a, v3 -- ADR-025)
+#
+# v3: entity names aligned with THIS repository's real schema (singular names:
+# order, order_item, employee, review, payment, customer; the generation log
+# reported datasets=8 -- add any entity still missing below, same shape).
+#
+# The harness now VALIDATES every configured column against each entity's
+# real CSV header at startup and fail-fasts printing the actual header, so a
+# wrong column guess is a guided one-line fix, never a silent misfire.
+#
+# Drills on this machine (quality root is data/corrupted per your [WRITER] log):
+#   clean    .venv\Scripts\python.exe dq_main.py --tree data\generated  --mode clean
+#   corrupt  .venv\Scripts\python.exe dq_main.py --tree data\corrupted --mode corrupt
+#
+# The harness is a consumer of output trees: it reads CSV files and this
+# config only. Checks default to enabled=true when absent from dq.checks.
+# =============================================================================
+
+dq:
+  checks:
+    not_null:
+      enabled: true          # required columns must be populated
+    fk_integrity:
+      enabled: true          # FK values must resolve within the same tree
+    value_in_range:
+      enabled: true          # numeric columns must sit inside declared ranges
+    pk_unique:
+      enabled: true          # primary keys must not repeat within a file
+
+  entities:
+    # --- customer: guessed from order's invalid_fk rule firing; the startup
+    # header check confirms or corrects the pk name on first run.
+    customer:
+      primary_key: customer_id
+      required: [customer_id]
+
+    order:
+      primary_key: order_id
+      required: [order_id]
+      foreign_keys:
+        customer_id: customer   # TODO verify column + parent against the real header
+
+    order_item:
+      primary_key: order_item_id
+      required: [order_item_id]
+      # out_of_range fired on this entity (65 rows) -- wire the real column and
+      # business range once confirmed from the header, e.g.:
+      # ranges:
+      #   quantity: {min: 1, max: 100, type: int}
+
+    employee:
+      primary_key: employee_id
+      required: [employee_id]
+
+    review:
+      primary_key: review_id
+      required: [review_id]
+
+    payment:
+      primary_key: payment_id
+      required: [payment_id]
+
+    # --- datasets=8 in your log: add the remaining entities here, same shape.
+    # Null rule fired on order (57 rows): once you know WHICH column was
+    # nulled, add it to that entity's required list so not_null catches it.
