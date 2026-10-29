@@ -437,3 +437,112 @@ pipeline, and what stays out of scope.
 - datasets=8 (two unseen entities), `order_item.product_id -> product`,
   and the engine-vs-harness FK reconciliation remain separate backlog
   items, unaffected by this ADR.
+---
+## ADR-029 — Milestone 6b: incremental change stream + CDC-style change log
+
+**Status:** Accepted (Milestone 6b — new `src/core/cdc/` module, no existing files modified)
+
+**Context.** Phase 5's window engine (ADR-0024) is live: every run writes
+per-window partitions (`{tree}/{entity}/reference_date={window}/…`, daily or
+monthly keys), fact/dimension split, manifest v3. What the platform does NOT
+yet produce is the downstream-facing artifact those windows imply: a change
+stream saying WHICH rows appeared, mutated, or vanished between consecutive
+windows, in a format a consumer can replay. The roadmap names both halves of
+Milestone 6b: an incremental change stream with INSERT/UPDATE/DELETE
+semantics, and a CDC-style change log format. The delivery constraint is the
+same one ADR-025 faced: the harness-side modules must integrate through
+documented, stable contracts (output-tree layouts + config files) because
+they are verified and installed without access to the generator's internals.
+
+**Decision.**
+1. **CDC is diff-based, over output trees.** `src/core/cdc/` reads TWO
+   windows of one entity from the same tree (the same class of reads the DQ
+   harness has done since ADR-025) and computes the change stream by
+   primary-key diff: key in current window only -> INSERT; key in previous
+   window only -> DELETE; key in both with differing row -> UPDATE; key in
+   both with identical row -> no event. Zero imports from generator, writer,
+   or impurity internals. In-generator event emission (hooks inside the
+   pipeline, true transaction ordering) is explicitly OUT OF SCOPE and stays
+   a registered future option — it requires touching `main.py`'s core and
+   the writers, which this delivery model cannot verify. Diff-based CDC is
+   replay-safe, works against every tree the engine has ever written, and
+   doubles as the reference implementation a consumer would write.
+2. **Change log format: JSONL, full before/after images.** One JSON object
+   per line, UTF-8, LF endings:
+   `{"seq": 1, "op": "INSERT", "entity": "order", "pk": "o-1",
+     "window": "2026-01-15", "prev_window": "2026-01-14",
+     "changed": [], "before": null, "after": {...}}`.
+   Canonical op names INSERT/UPDATE/DELETE. Full row images (not field
+   deltas) keep events self-contained and replayable; `changed` additionally
+   carries the sorted list of differing columns for UPDATEs. `before` is
+   carried for UPDATE/DELETE and dropped when `options.before_images: false`
+   (images always reflect the raw string cells exactly as the files hold
+   them — same reader-boundary philosophy as ADR-028 decision 3: every cell
+   is a str, missing cells are ""). `seq` is 1-based per entity per run,
+   assigned in ascending primary-key order — byte-identical output on
+   re-runs, deterministic across platforms.
+3. **Window pairing: explicit or auto-detected; first run is the initial
+   load.** `cdc_main.py --window W` pairs W with the latest EARLIER window
+   present for that entity (auto), unless `--prev-window P` is given
+   (explicit; P == W and P > W fail fast). When no earlier window exists,
+   the run is an INITIAL LOAD: every current row becomes an INSERT event and
+   `prev_window` is null — the standard CDC bootstrap semantics — unless
+   `options.initial_load: error` is set, which makes a missing predecessor a
+   hard failure for teams that only ever want deltas.
+4. **Snapshot validity is enforced.** CDC compares per-window SNAPSHOTS, so
+   a primary key may appear at most once per window per entity: a duplicate
+   fails fast naming the key and both row numbers. Headers of the two
+   compared windows must have the same column set unless
+   `options.allow_schema_drift: true`, in which case the diff runs over the
+   union of headers and cells absent from a window read as "" (the
+   impurity engine's drift rule can add columns, so corrupted trees need
+   this switch; clean trees never will).
+5. **Output layout, guard, report.** Change logs land in their own derived
+   tree, never inside the source: `data/cdc/{entity}/reference_date={window}/
+   {prev|initial}__{window}.jsonl` plus one run report `data/cdc/report.json`
+   (REPORT_VERSION 1, atomic write, same .tmp + os.replace discipline as
+   every writer). The runner refuses any `output_root` that sits inside the
+   source tree or vice versa (both directions), mirroring the impurity
+   engine's quality-write guard. Per-window filenames carry BOTH windows, so
+   re-runs with a different predecessor never silently overwrite a different
+   analysis. Manifest v3 for the cdc tree is deferred (derived artifact,
+   rebuildable; the report carries sha256-free counts and file labels).
+6. **Contract and budget unchanged.** No new dependency (stdlib + PyYAML,
+   already in use). Exit codes 0/1/130; new `[CDC]` log tag, additive to
+   ADR-0009 exactly as `[DQ]` was in ADR-025 (no §26 trigger). The ledger
+   identity `inserts − deletes ≡ rows_curr − rows_prev` is asserted before
+   every success — a cheap, permanent reconciliation guard on the diff
+   engine itself. The DQ suite (103 tests) is untouched; CDC ships its own
+   test files.
+
+**Alternatives considered.**
+- In-generator incremental emission now: INSERT/UPDATE/DELETE decided while
+  rows are generated. Rejected for 6b — needs core pipeline + writer access,
+  cannot be sandbox-verified under the bootstrap delivery model, and couples
+  the stream to the generator's internals. Registered as the future upgrade
+  path (the JSONL format is chosen so those events can slot in unchanged).
+- duckdb/SQL diffing: a new dependency and a paradigm shift for a two-file
+  key-diff. Rejected (same reasoning as ADR-028's duckdb alternative).
+- Field-delta-only payloads (no images): smaller files, but consumers cannot
+  replay state from the log alone and every schema change bites. Rejected.
+- CSV change log: quoting churn and no stream semantics; JSONL is the
+  NDJSON writer's existing family (ADR-0017) and streams line-by-line.
+  Rejected.
+- Hard-require a previous window: breaks the first run against an existing
+  tree for no informational gain. Rejected (initial-load default, `error`
+  available).
+
+**Consequences.**
+- The change stream is derivable at any time from any two windows of any
+  tree the platform wrote — including `data/corrupted`, where drift handling
+  (decision 4) applies.
+- Initial loads on big entities produce one event per row (all six entities
+  ≈ 23k events ≈ a few MB of JSONL); wire `cdc.entities` selectively if
+  that matters, and prefer delta runs once a second window exists.
+- A future DQ check can consume the cdc tree as a new surface (e.g. "every
+  current row appears as an INSERT or UPDATE after-image") — registered as
+  backlog synergy with the 7-track, not part of 6b.
+- If the engine later grows true incremental emission, the JSONL schema
+  (decision 2) is the contract both producers write; `seq` then becomes the
+  merge key instead of a per-run index.
+

@@ -1,0 +1,68 @@
+# =============================================================================
+# cdc_base.yaml -- CDC change stream configuration (Milestone 6b, ADR-029)
+#
+# The CDC module is a CONSUMER of output trees (ADR-025 precedent): it reads
+# consecutive windows of each configured entity from source_tree and writes
+# the change log under output_root -- INSERT / UPDATE / DELETE per primary
+# key, full before/after images, one JSON object per line.
+#
+#   source_tree : any tree the platform wrote (data/generated; point it at
+#                 data/corrupted to stream the impurity engine's changes --
+#                 pair with options.allow_schema_drift: true there, because
+#                 the drift rule adds columns between windows).
+#   output_root : data/cdc (derived tree; the runner REFUSES to write it
+#                 inside the source tree or vice versa).
+#
+#   options:
+#     before_images      -- keep the full previous row on UPDATE/DELETE
+#                           events (replay safety). false = smaller files.
+#     allow_schema_drift -- diff over the UNION of the two windows' columns
+#                           instead of fail-fast when headers differ.
+#     initial_load       -- "inserts" (default): the first run with no
+#                           earlier window emits every row as INSERT
+#                           (prev_window=null). "error": refuse instead.
+#
+#   entities: primary_key required; optional columns = change-DETECTION
+#             whitelist (images always carry full rows regardless).
+#
+# First drills (single window on this machine):
+#   .venv\Scripts\python.exe cdc_main.py --window 2026-01-15
+#   -> data\cdc\report.json + per-entity JSONL under data\cdc\<entity>\
+# With a second window generated:
+#   .venv\Scripts\python.exe cdc_main.py --window <newer>
+#   (prev auto-detected; or pass --prev-window explicitly)
+#
+# customer/order/order_item are wired (the three highest-volume entities --
+# an initial load emits one event per row, so wire more entities when you
+# actually need their streams). [CDC] is the new log tag (ADR-029).
+# =============================================================================
+
+cdc:
+  source_tree: data/generated
+  output_root: data/cdc
+
+  options:
+    before_images: true
+    allow_schema_drift: false
+    initial_load: inserts
+
+  entities:
+    customer:
+      primary_key: customer_id
+
+    order:
+      primary_key: order_id
+      # foreign keys are irrelevant to the diff -- CDC works per entity
+
+    order_item:
+      primary_key: order_item_id
+
+    # --- wire the remaining entities the same way when needed:
+    # employee:  {primary_key: employee_id}
+    # review:    {primary_key: review_id}
+    # payment:   {primary_key: payment_id}
+    #
+    # --- change-detection whitelist example (images stay full either way):
+    # order:
+    #   primary_key: order_id
+    #   columns: [status, sales_rep_employee_id]
