@@ -1,0 +1,61 @@
+# =============================================================================
+# stream_base.yaml -- event stream configuration (Milestone 6c, ADR-030)
+#
+# The stream layer CONSUMES the CDC journals written by Milestone 6b
+# (ADR-029) and the platform's snapshot trees, and produces the operational
+# event stream:
+#
+#   replay  -- fold each entity's journal chain (initial + deltas, ordered
+#              by (window, seq)) back into keyed state, then VERIFY every
+#              folded window prefix against the snapshot the platform
+#              wrote: state == fold(events) must hold row-for-row.
+#   export  -- re-emit the same events as ONE append-only, offset-addressed
+#              log per entity (Kafka-log-style envelope: offset/key/op/
+#              value, DELETE = tombstone with value=null).
+#
+#   journal_root  : data/cdc      (read-only; written by cdc_main.py)
+#   snapshot_root : data/generated (read-only; the replay yardstick)
+#   output_root   : data/streams  (derived tree; the runner REFUSES any
+#                    overlap with the other two roots, both directions)
+#
+#   options:
+#     verify_replay -- compare folded state vs snapshots (cell-level).
+#                      Missing snapshot for a window = recorded as
+#                      match=null (unverified), never a silent pass.
+#     byte_compare  -- ALSO compare rendered-CSV bytes when cells match.
+#                      Informational only: row order and CSV dialect belong
+#                      to the generator's writer, not to the replay
+#                      contract, so this stays off by default.
+#
+#   entities: primary_key must match the pk used in configs/cdc_base.yaml
+#             (the journals key events by that column's values).
+#
+# Drills (after cdc_main.py has produced journals):
+#   .venv\Scripts\python.exe stream_main.py
+#   .venv\Scripts\python.exe stream_main.py --entity order --up-to-window 2026-01-15
+#   .venv\Scripts\python.exe stream_main.py --mode replay
+# =============================================================================
+
+stream:
+  journal_root: data/cdc
+  snapshot_root: data/generated
+  output_root: data/streams
+
+  options:
+    verify_replay: true
+    byte_compare: false
+
+  entities:
+    customer:
+      primary_key: customer_id
+
+    order:
+      primary_key: order_id
+
+    order_item:
+      primary_key: order_item_id
+
+    # --- wire the remaining entities the same way once cdc_main covers them:
+    # employee:  {primary_key: employee_id}
+    # review:    {primary_key: review_id}
+    # payment:   {primary_key: payment_id}

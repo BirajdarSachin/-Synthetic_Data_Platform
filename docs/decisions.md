@@ -546,3 +546,117 @@ they are verified and installed without access to the generator's internals.
   (decision 2) is the contract both producers write; `seq` then becomes the
   merge key instead of a per-run index.
 
+---
+## ADR-030 — Milestone 6c: event stream replay + export (tracker Phase 6, event streams)
+
+**Status:** Accepted (Milestone 6c — new `src/core/stream/` module, no existing files modified)
+
+**Context.** After Milestone 6b (ADR-029) the platform owns three temporal
+views of the same data: per-window state slices (6a windows), state DIFFS
+between consecutive windows (6b CDC journals), and nothing that proves the
+journals are actually REPLAYABLE or consumable as a stream. The roadmap's
+Phase 6 names "event streams". The defining property of an event stream —
+as opposed to a log file — is that state is a function of events:
+`state == fold(events)`. The 6b journals were designed for this (full row
+images, per-window `seq`, deterministic order), but nothing exercised it.
+The delivery constraint is unchanged since ADR-025: streaming-side modules
+integrate through documented, stable contracts (output-tree layouts +
+config files) and are verified without access to the generator's internals.
+
+**Decision.**
+1. **The CDC journal chain IS the event stream; 6c makes it operational.**
+   `src/core/stream/` consumes `data/cdc` (journals, read-only) and
+   `data/generated` (snapshots, read-only) and produces `data/streams`
+   (derived). Zero imports from generator, writer, or impurity internals.
+   True in-generator event sourcing (hooks inside the pipeline, transaction
+   ordering) remains the registered future upgrade path, exactly as in
+   ADR-029: the JSONL contracts are chosen so a future native producer can
+   slot in without changing consumers.
+2. **Replay is a strict ordered fold.** Events are ordered by
+   `(window, seq)` — ISO window keys make lexicographic order chronological.
+   Fold semantics: INSERT sets state[key] = after (key must NOT be live —
+   a live key was never deleted, so an INSERT would mean a forked chain);
+   UPDATE replaces state[key] with the full after image (key must be live);
+   DELETE removes the key (must be live; `after` must be null — the
+   tombstone). Resurrection is legal: a DELETE frees the key, so a later
+   INSERT is a fresh birth. Every contract violation fails fast naming the
+   journal file and line. Column order for replayed rows comes from the
+   first full row image; later images must carry the same column SET (order
+   differences tolerated, set differences fail fast). Duplicate
+   `(window, seq)` positions fail fast — two events cannot own one offset.
+3. **Replay is VERIFIED against the snapshots.** After folding each window
+   of the chain, the folded state is compared with the platform's snapshot
+   for that window: key sets and per-key cell values (every cell a str, the
+   ADR-028 reader-boundary). `state == fold(events)` row-for-row is the
+   invariant; up to 5 sample mismatches are reported. A missing snapshot is
+   recorded as `match=null` (unverified — never a silent pass); a real
+   mismatch fails the run (exit 1). Byte-level CSV identity is an
+   INFORMATIONAL extra (`options.byte_compare`, default off): row order and
+   CSV dialect belong to the generator's writer, not to the replay
+   contract.
+4. **Export: one append-only, offset-addressed log per entity.** The chain's
+   events are re-emitted in (window, seq) order as
+   `data/streams/{entity}/part-00000.jsonl`, one envelope per line:
+   `{"offset": 7, "key": "o-3", "op": "UPDATE", "entity": "order",
+     "window": "2026-01-16", "seq": 3, "value": {...full after image...}}`
+   with `value=null` on DELETE (tombstone convention). Offsets are 1..N
+   across the WHOLE chain and are recomputed from the journal set on every
+   run — deterministic, byte-identical re-runs, no state file to corrupt.
+   `offsets.json` records the per-window ranges as a consumer checkpoint.
+   Topic compaction (latest-wins keyed view) is deliberately deferred: the
+   replayed state IS the compacted view; exporting it is a registered
+   future option.
+5. **Output layout, guard, report.** `data/streams/{entity}/part-00000.jsonl`
+   + `data/streams/{entity}/offsets.json` + `data/streams/report.json`
+   (REPORT_VERSION 1, atomic .tmp + os.replace). The runner refuses any
+   `output_root` that overlaps the journal root or the snapshot root in
+   either direction (contains or is contained), mirroring the 6b guard.
+   Journal chains are validated before folding: exactly one initial journal
+   (its absence fails with a "run cdc_main.py --window <earliest>" hint),
+   deltas linked prev→window without gaps (a gap fails with the windows
+   present and the filling command), partition-name/filename window
+   mismatches and unclassifiable filenames fail fast. An entity with NO
+   journals is skipped with a log line and report entry — a legitimate
+   state (cdc_main was never run for it), not an error; a missing journal
+   ROOT fails the run (the operator probably pointed at the wrong tree).
+6. **Modes, contract and budget unchanged.** `--mode both` (default) =
+   verify + export; `replay` = verify only, writes no stream files;
+   `export` = fold + export, skips snapshot verification (the fold's strict
+   contract checks still run). No new dependency (stdlib + PyYAML). Exit
+   codes 0/1/130; new `[STREAM]` log tag, additive to ADR-0009 exactly as
+   `[DQ]` and `[CDC]` were (no §26 trigger). The DQ suite (103 tests) and
+   CDC suite (39 tests) are untouched; 6c ships its own test files.
+
+**Alternatives considered.**
+- Native in-generator event sourcing now: rejected for 6c for the ADR-029
+  reasons (core pipeline access, unverifiable under the bootstrap delivery
+  model). The journal-chain design means nothing consumer-side changes when
+  the native producer arrives.
+- Publish to a real broker (Kafka/Mosquitto): a new dependency and an
+  external service; the file-based offset log models the same semantics
+  (append-only, offset-addressed, tombstones) with zero ops burden. A
+  future `--sink` option can bridge to a broker using the same envelopes.
+- duckdb/SQL materialize-and-compare: a new dependency for a keyed-dict
+  fold and a set compare. Rejected (same reasoning as ADR-028/029).
+- Field-delta replay (apply only `changed` columns): the journals already
+  carry full images (ADR-029 decision 2), so image-replacement is simpler
+  and strictly more robust; delta-only replay would additionally require
+  every producer to keep `changed` complete forever. Rejected.
+- Verify only the LAST window instead of every prefix: cheaper, but prefix
+  verification localizes a mismatch to the exact window where the chain and
+  the snapshots diverged — the whole point of the invariant. Kept.
+
+**Consequences.**
+- `stream_main.py` after every `cdc_main.py` run is the standing end-to-end
+  audit: if the journals and the snapshot tree ever disagree — writer bug,
+  manual edit, partial copy — the replay names the window and the keys.
+- The exported `part-00000.jsonl` gives downstream projects (Phase 7 scale
+  work, ingestion drills) a realistic stream fixture without any broker:
+  ordered, offset-addressed, tombstoned, deterministic.
+- Large initial loads fold in memory ({pk: row} dicts; 23k rows ≈ a few MB)
+  — fine at this scale; a spill-to-disk fold is a registered future need,
+  not a current one.
+- Synergy backlog: a DQ check over `data/streams` (e.g. offsets contiguous,
+  tombstones never resurrect inside one window) can now consume a third
+  derived tree the same way 7-track checks consume the others.
+

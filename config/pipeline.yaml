@@ -5,7 +5,7 @@ run:
   seed: 12345                 # master seed - drives all randomness (ADR-0006)
 
 generation:
-  reference_date: 2026-01-15  # simulated "today" for generated data (ADR-0003)
+  reference_date: 2026-01-16 # simulated "today" for generated data (ADR-0003)
   history: "3y"               # how far back history extends (ADR-0012)
 
 datasets:
@@ -27,28 +27,28 @@ datasets:
     records: 2000             # unique customer/product pairs from completed purchases
 
 output:
-  directory: data/corrupted   # resolved against project root (ADR-0010)
+  directory: data/generated   # resolved against project root (ADR-0010)
   format: csv
 
 # Impurity engine (ADR-0021/0022/0023) - commented out = CLEAN runs.
 # When active, output.directory MUST point at data/corrupted (guard in main.py).
 # Fixed chain: null -> invalid_fk -> out_of_range -> drift -> duplicate.
-quality:
-  null_rate: 0.01           # one field nulled on a fraction of records
-  duplicate_rate: 0.02      # records re-emitted as exact delayed copies
-  invalid_fk_rate: 0.005    # records with an out-of-range FK
-  out_of_range_rate: 0.005  # numeric fields negated
-  drift_rate: 0.0           # records with dropped/extra columns
-  datasets:
-    customer:
-      null_fields: [phone, city]
-    order:
-      null_fields: [status]
-      invalid_fk_fields:    # FK field -> parent dataset (explicit mapping)
-        customer_id: customer
-        sales_rep_employee_id: employee
-    order_item:
-      out_of_range_fields: [quantity]
-    product:
-      drop_fields: [category]     # schema drift: missing column
-      extra_fields: [legacy_sku]  # schema drift: unexpected column
+# quality:
+#   null_rate: 0.01           # one field nulled on a fraction of records
+#   duplicate_rate: 0.02      # records re-emitted as exact delayed copies
+#   invalid_fk_rate: 0.005    # records with an out-of-range FK
+#   out_of_range_rate: 0.005  # numeric fields negated
+#   drift_rate: 0.0           # records with dropped/extra columns
+#   datasets:
+#     customer:
+#       null_fields: [phone, city]
+#     order:
+#       null_fields: [status]
+#       invalid_fk_fields:    # FK field -> parent dataset (explicit mapping)
+#         customer_id: customer
+#         sales_rep_employee_id: employee
+#     order_item:
+#       out_of_range_fields: [quantity]
+#     product:
+#       drop_fields: [category]     # schema drift: missing column
+#       extra_fields: [legacy_sku]  # schema drift: unexpected column
