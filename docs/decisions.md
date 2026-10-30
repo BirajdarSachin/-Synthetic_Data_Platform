@@ -660,3 +660,107 @@ config files) and are verified without access to the generator's internals.
   tombstones never resurrect inside one window) can now consume a third
   derived tree the same way 7-track checks consume the others.
 
+---
+## ADR-031 — Milestone 6d: topic compaction export (tracker Phase 6, event streams)
+
+**Status:** Accepted (Milestone 6d — adds `compact.py` + `compact_main.py` inside the
+existing `src/core/stream/` package; no existing files modified)
+
+**Context.** Milestone 6c (ADR-030) made the CDC journal chain operational as an
+event stream: `data/streams/{entity}/part-00000.jsonl` is an append-only,
+offset-addressed log with tombstoned DELETEs, and `state == fold(events)` is
+verified against the snapshot tree. ADR-030 decision 4 deliberately deferred the
+topic-compaction view: "the replayed state IS the compacted view; exporting it is
+a registered future option." Downstream consumers now exist on paper (Phase 7
+scale work, ingestion drills) and they want the KEYED CURRENT STATE — the
+KTable analogue — without folding N events themselves. The delivery constraint
+is unchanged since ADR-025: stream-side modules integrate through documented,
+stable contracts (output-tree layouts + config files) and are verified without
+access to the generator's internals.
+
+**Decision.**
+1. **Compaction is a log transformation, not a journal reader.** The new
+   `src/core/stream/compact.py` consumes ONLY the 6c stream log
+   (`data/streams`, read-only) plus the snapshot tree as its verification
+   yardstick (`data/generated`, read-only), and produces
+   `data/streams_compacted` (derived). It never reads `data/cdc` — the log is
+   the input contract, so a future native producer (registered future in
+   ADR-029/030) feeds compaction unchanged. Zero imports from generator,
+   writer, or impurity internals; reuses `check_containment`,
+   `snapshot_candidates`, `read_snapshot` from the 6c runner (same package,
+   proven code, no duplication).
+2. **Retention rule: latest-wins per key, Kafka log-compaction semantics.**
+   For each key the record with the HIGHEST source offset is retained; the
+   compacted log is the retained subsequence re-emitted in ascending source
+   offset order, with each retained line byte-identical to its source line
+   (envelope, offset and all — a compacted record is a source record, never a
+   re-derivation). DELETEs retained by default: a key whose latest record is a
+   tombstone stays in the log as `value=null` so consumers learn about the
+   deletion. `options.drop_tombstones: true` instead drops such keys entirely,
+   turning the output into a pure live-state table.
+3. **Source integrity is validated before folding.** Every log line must be a
+   JSON object satisfying the ADR-030 wire contract (op in {INSERT, UPDATE,
+   DELETE}; key/window non-empty strings; positive integer seq; INSERT/UPDATE
+   carry a full `{column: str}` image whose `primary_key` cell equals the
+   envelope key; DELETE carries `value=null`; envelope entity matches the
+   directory). The per-line offset must equal the line number — any gap,
+   duplicate, or reorder fails fast naming the file and line. The
+   `offsets.json` checkpoint left by 6c must agree (`events`, `last_offset`);
+   disagreement fails with a "re-run stream_main.py" hint. An entity tree
+   that is half-present (part file xor offsets.json) fails; a wholly absent
+   entity directory is a legitimate skip (stream_main was never run for it).
+4. **State verification: compacted(log) == state_at(log's last window).**
+   The log's last window is the lexicographic max over envelope windows. The
+   compacted LIVE view (non-DELETE retained records) is compared with the
+   snapshot of that window — key sets and per-key cell values (`{column: str}`,
+   the ADR-028 reader boundary), up to 5 sample mismatches. A missing snapshot
+   is recorded as `match=null` (unverified — never a silent pass); a real
+   mismatch fails the run (exit 1) and names the samples. This closes the
+   loop across all three layers: journals fold to state (6c), the log
+   compacts to the same state (6d), and both agree with the snapshots the
+   platform wrote. `options.verify_state: false` disables the check.
+5. **Output layout, guard, report.** `data/streams_compacted/{entity}/
+   part-00000.jsonl` + `data/streams_compacted/{entity}/offsets.json`
+   (checkpoint: records, retained, live_keys, tombstones, source_last_offset,
+   last_window) + `data/streams_compacted/report.json` (REPORT_VERSION 1,
+   atomic .tmp + os.replace). The containment guard refuses any
+   `output_root` that overlaps the stream root or the snapshot root in either
+   direction (reusing the 6c guard).
+6. **Contract unchanged.** No new dependency (stdlib + PyYAML). Exit codes
+   0/1/130; new `[COMPACT]` log tag, additive to ADR-0009 exactly as `[STREAM]`
+   was (no §26 trigger). The DQ (103), CDC (39) and 6c stream (42) suites are
+   untouched; 6d ships its own test file.
+
+**Alternatives considered.**
+- Key-sorted table output (`{key: row}` JSON): friendlier for table lookups,
+  but it abandons log semantics (no offsets, no tombstones, no ordering
+  guarantees) and is trivially derivable by any consumer from the compacted
+  log. Rejected; a key-sorted renderer remains a registered future option.
+- Compact inside 6c's export (single pass): couples two concerns and would
+  not work on logs produced by any other compliant producer. The separate
+  transformation keeps each stage independently verifiable and idempotent.
+- Drop tombstones by default: matches "current state" intuition but silently
+  hides deletions from consumers that matter (audits, CDC mirrors). Kept
+  opt-in.
+- Verify against the LATEST snapshot of the entity instead of the log's last
+  window: false-fails in the legitimate mid-pipeline state where a new window
+  was generated but cdc_main/stream_main have not caught up. The log's own
+  last window is the only reference that makes compacted(log) well-defined.
+- Read the journals directly and skip the log: duplicates 6c, bypasses the
+  log contract, and would hide a corrupted stream log instead of exposing it.
+- duckdb/pandas for the fold: a new dependency for a dict comprehension.
+  Rejected (same reasoning as ADR-028/029/030).
+
+**Consequences.**
+- `data/streams_compacted/{entity}/part-00000.jsonl` is a realistic
+  state-table fixture (ordered, offset-addressed, tombstone-aware) for
+  Phase 7 ingestion/scale drills — no broker, no database.
+- The offsets.json cross-check makes 6d a standing integrity audit of the
+  6c log: a truncated, hand-edited, or partially copied stream log fails
+  with file:line precision instead of propagating silently.
+- Compaction holds one {key: record} map in memory (23k keys ≈ a few MB) —
+  fine at this scale; spilling is a registered future need.
+- Synergy backlog: DQ checks over `data/streams_compacted` (e.g. live keys
+  unique, no tombstone with value) can consume the fourth derived tree the
+  same way the 7-track checks consume the others.
+

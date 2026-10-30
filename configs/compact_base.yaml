@@ -1,0 +1,53 @@
+# =============================================================================
+# compact_base.yaml -- topic compaction configuration (Milestone 6d, ADR-031)
+#
+# The compaction layer CONSUMES the stream logs written by Milestone 6c
+# (ADR-030) and the platform's snapshot trees, and produces the compacted,
+# latest-wins-per-key view (the KTable analogue):
+#
+#   stream_root   : data/streams           (read-only; written by stream_main.py)
+#   snapshot_root : data/generated         (read-only; the verification yardstick)
+#   output_root   : data/streams_compacted (derived tree; the runner REFUSES any
+#                    overlap with the other two roots, both directions)
+#
+#   options:
+#     drop_tombstones -- false (default): a key whose latest record is a
+#                        DELETE stays in the compacted log as value=null
+#                        (Kafka tombstone retention). true: such keys are
+#                        dropped entirely -> a pure live-state table.
+#     verify_state    -- compare the compacted live view against the snapshot
+#                        of the log's LAST window (cell-level). Missing
+#                        snapshot = match=null (unverified), never a silent
+#                        pass.
+#
+#   entities: primary_key must match the pk used in configs/stream_base.yaml
+#             (the log envelopes key records by that column's values).
+#
+# Drills (after stream_main.py has produced data/streams/):
+#   .venv\Scripts\python.exe compact_main.py
+#   .venv\Scripts\python.exe compact_main.py --entity order
+# =============================================================================
+
+compaction:
+  stream_root: data/streams
+  snapshot_root: data/generated
+  output_root: data/streams_compacted
+
+  options:
+    drop_tombstones: false
+    verify_state: true
+
+  entities:
+    customer:
+      primary_key: customer_id
+
+    order:
+      primary_key: order_id
+
+    order_item:
+      primary_key: order_item_id
+
+    # --- wire the remaining entities the same way once stream_main covers them:
+    # employee:  {primary_key: employee_id}
+    # review:    {primary_key: review_id}
+    # payment:   {primary_key: payment_id}
